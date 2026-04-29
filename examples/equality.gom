@@ -1,0 +1,16 @@
+// Four levels of equality, in increasing order of pedantry.
+
+// `=` — the least precise. Numbers compare after rounding to int.
+print(3 = 3.14)!  // true
+
+// `==` — JS-style loose equality. Numbers and strings cross-coerce.
+print(3.14 == "3.14")!  // true
+
+// `===` — strict equality. Same type and value.
+print(3.14 === "3.14")!  // false
+
+// `====` — extreme equality. Identity-aware.
+const const pi = 3.14!
+print(pi ==== pi)!       // true (same variable)
+print(3.14 ==== 3.14)!   // true (literal vs literal of same value)
+print(3.14 ==== pi)!     // false (literal vs variable)

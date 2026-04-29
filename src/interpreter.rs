@@ -154,7 +154,7 @@ impl Interpreter {
                 let _ = span;
                 Ok(())
             }
-            Stmt::Let { .. } => self.exec_let(stmt, self.line),
+            Stmt::Let { .. } => self.exec_let_in(stmt, self.line, scope),
             Stmt::Assign {
                 target,
                 value,
@@ -271,14 +271,20 @@ impl Interpreter {
                 };
                 Err(return_signal(v, *span))
             }
-            other => Err(self.todo(
-                &format!("statement kind {:?}", std::mem::discriminant(other)),
-                stmt_span(other),
-            )),
         }
     }
 
     pub(crate) fn exec_let(&mut self, stmt: &Stmt, line: usize) -> Result<(), Diagnostic> {
+        let scope = Rc::clone(&self.globals);
+        self.exec_let_in(stmt, line, &scope)
+    }
+
+    pub(crate) fn exec_let_in(
+        &mut self,
+        stmt: &Stmt,
+        line: usize,
+        scope: &Scope,
+    ) -> Result<(), Diagnostic> {
         let Stmt::Let {
             decl,
             const_depth,
@@ -292,13 +298,12 @@ impl Interpreter {
         else {
             unreachable!()
         };
-        let scope = Rc::clone(&self.globals);
-        let v = self.eval_expr(value, &scope)?;
+        let v = self.eval_expr(value, scope)?;
         let eternal = *const_depth >= 3;
         match target {
             BindingTarget::Ident { name, span: _ } => {
                 env::insert(
-                    &scope,
+                    scope,
                     Binding {
                         name: name.clone(),
                         value: v,
@@ -1034,22 +1039,6 @@ fn number_name(name: &str) -> Option<f64> {
     })
 }
 
-fn stmt_span(s: &Stmt) -> Span {
-    match s {
-        Stmt::Let { span, .. }
-        | Stmt::Expr { span, .. }
-        | Stmt::Assign { span, .. }
-        | Stmt::If { span, .. }
-        | Stmt::When { span, .. }
-        | Stmt::FnDecl { span, .. }
-        | Stmt::ClassDecl { span, .. }
-        | Stmt::Return { span, .. }
-        | Stmt::Delete { span, .. }
-        | Stmt::Export { span, .. }
-        | Stmt::Import { span, .. }
-        | Stmt::Reverse { span } => *span,
-    }
-}
 
 #[allow(dead_code)]
 fn _used_in_later_commits(_: DeclKind, _: &mut BuiltinFn) {}

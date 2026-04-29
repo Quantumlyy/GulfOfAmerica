@@ -29,9 +29,12 @@ unsafe_code = "forbid"
 unused_must_use = "deny"
 
 [lints.clippy]
-all = "warn"
-pedantic = "warn"
-# A few pedantic lints are too noisy for an interpreter.
+# Group priorities: the `pedantic` group is loud, so we set it to a lower
+# priority than the per-lint allows below.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# A pile of pedantic lints are too noisy for a hand-written interpreter that
+# cares more about clarity than purity.
 module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
@@ -41,4 +44,29 @@ cast_possible_truncation = "allow"
 cast_precision_loss = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
+cast_lossless = "allow"
 similar_names = "allow"
+needless_raw_string_hashes = "allow"
+match_wildcard_for_single_variants = "allow"
+single_match_else = "allow"
+return_self_not_must_use = "allow"
+unnecessary_wraps = "allow"
+unused_self = "allow"
+map_unwrap_or = "allow"
+many_single_char_names = "allow"
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+match_same_arms = "allow"
+elidable_lifetime_names = "allow"
+collapsible_match = "allow"
+type_complexity = "allow"
+manual_let_else = "allow"
+if_not_else = "allow"
+if_same_then_else = "allow"
+format_push_string = "allow"
+manual_str_repeat = "allow"
+missing_fields_in_debug = "allow"
+print_literal = "allow"
+uninlined_format_args = "allow"
+vec_init_then_push = "allow"
+assigning_clones = "allow"

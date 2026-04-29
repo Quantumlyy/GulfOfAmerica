@@ -1,0 +1,6 @@
+// Variable hoisting via a negative lifetime.
+print(name)!
+const const name<-1> = "Luke"!
+
+// (The print above succeeds because `name<-1>` is *alive* on every line
+// before its declaration, and dead from the declaration onwards.)

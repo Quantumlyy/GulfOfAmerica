@@ -1,0 +1,7 @@
+// Be bold!
+print("Hello, Gulf of America!")!
+print("Be even bolder!")!!!
+
+// `?` is the debug variant of `!`. It runs the statement and prints what it
+// computed, source and all.
+print(1 + 2*3)?
