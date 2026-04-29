@@ -43,6 +43,7 @@ fn install_fn(
             created_at: interp.start_time,
             lifetime: Some(crate::ast::Lifetime::Infinity),
             eternal: true,
+            previous_value: None,
         },
     );
 }

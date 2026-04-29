@@ -731,3 +731,206 @@ print(name)!
 "#;
     err_contains(src, &["name", "expired"]);
 }
+
+// ---------------------------------------------------------------------------
+// § Signals — `use(initial)` returns a getter/setter pair.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn signals_destructured_pair_round_trips() {
+    let src = r#"
+const var [getScore, setScore] = use(0)!
+print(getScore())!
+setScore(7)!
+print(getScore())!
+"#;
+    assert_eq!(out(src), "0\n7\n");
+}
+
+#[test]
+fn signals_setter_visible_through_getter() {
+    let src = r#"
+const var [count, setCount] = use(10)!
+setCount(count() + 1)!
+setCount(count() + 1)!
+print(count())!
+"#;
+    assert_eq!(out(src), "12\n");
+}
+
+#[test]
+fn signals_callable_directly_when_not_destructured() {
+    // A non-destructured signal binding is itself callable: zero args reads,
+    // one arg writes.
+    let src = r#"
+const var sig = use(5)!
+print(sig())!
+sig(99)!
+print(sig())!
+"#;
+    assert_eq!(out(src), "5\n99\n");
+}
+
+// ---------------------------------------------------------------------------
+// § previous / next / current
+// ---------------------------------------------------------------------------
+
+#[test]
+fn time_current_returns_current_value() {
+    let src = r#"
+var var name = "Luke"!
+print(current name)!
+"#;
+    assert_eq!(out(src), "Luke\n");
+}
+
+#[test]
+fn time_previous_returns_value_before_last_reassignment() {
+    let src = r#"
+var var name = "Luke"!
+name = "Lu"!
+print(previous name)!
+print(name)!
+"#;
+    assert_eq!(out(src), "Luke\nLu\n");
+}
+
+#[test]
+fn time_previous_falls_back_to_current_when_never_reassigned() {
+    let src = r#"
+var var name = "Luke"!
+print(previous name)!
+"#;
+    assert_eq!(out(src), "Luke\n");
+}
+
+#[test]
+fn time_next_peeks_at_upcoming_assignment() {
+    let src = r#"
+var var name = "Luke"!
+print(next name)!
+name = "Lu"!
+print(name)!
+"#;
+    assert_eq!(out(src), "Lu\nLu\n");
+}
+
+// ---------------------------------------------------------------------------
+// § Async functions — line-interleaved execution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn async_un_awaited_call_interleaves_with_main_thread() {
+    // The body of `tick()` runs one statement per main-thread statement.
+    let src = r#"
+async function tick() => {
+   print("a")!
+   print("b")!
+}
+print("1")!
+tick()!
+print("2")!
+print("3")!
+"#;
+    // After the `tick()` call: main has emitted "1", task queued.
+    // After `print("2")`: main "2", tick fires once: "a".
+    // After `print("3")`: main "3", tick fires again: "b".
+    assert_eq!(out(src), "1\na\n2\nb\n3\n");
+}
+
+#[test]
+fn async_await_runs_synchronously_and_returns_value() {
+    let src = r#"
+async function compute() => {
+   return 42!
+}
+const const result = await compute()!
+print(result)!
+"#;
+    assert_eq!(out(src), "42\n");
+}
+
+#[test]
+fn async_drains_pending_after_main_thread_finishes() {
+    // The main thread issues only two statements; the queued `task` body has
+    // three. After every main statement (including the call itself) the
+    // pending tasks tick once, so the trailing two ticks happen during the
+    // post-main drain.
+    let src = r#"
+async function task() => {
+   print("first")!
+   print("second")!
+   print("third")!
+}
+task()!
+print("main done")!
+"#;
+    assert_eq!(out(src), "first\nmain done\nsecond\nthird\n");
+}
+
+// ---------------------------------------------------------------------------
+// § reverse! — flips the remaining statements in the file.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reverse_flips_remaining_statements() {
+    let src = r#"
+print("a")!
+print("b")!
+reverse!
+print("c")!
+print("d")!
+"#;
+    assert_eq!(out(src), "a\nb\nd\nc\n");
+}
+
+#[test]
+fn reverse_at_program_start_runs_everything_in_reverse() {
+    let src = r#"
+reverse!
+print("a")!
+print("b")!
+print("c")!
+"#;
+    assert_eq!(out(src), "c\nb\na\n");
+}
+
+// ---------------------------------------------------------------------------
+// § export … to / import — plumbing values between `=====`-separated files.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_to_main_imports_function() {
+    let src = r#"
+function add(a, b) => a + b!
+export add to "main.gom"!
+===== main.gom =====
+import add!
+print(add(3, 2))!
+"#;
+    assert_eq!(out(src), "5\n");
+}
+
+#[test]
+fn export_to_main_imports_value() {
+    let src = r#"
+const const greeting = "hi"!
+export greeting to "main.gom"!
+===== main.gom =====
+import greeting!
+print(greeting)!
+"#;
+    assert_eq!(out(src), "hi\n");
+}
+
+#[test]
+fn import_without_matching_export_errors() {
+    err_contains(
+        r#"
+===== main.gom =====
+import nope!
+print(nope)!
+"#,
+        &["import", "nope"],
+    );
+}

@@ -14,17 +14,20 @@
 mod builtins;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
 use crate::ast::{
-    BinOp, BindingTarget, BoolVal as AstBool, DeclKind, Expr, Lifetime, Program, Stmt, StrPart,
-    UnaryOp,
+    BinOp, BindingTarget, BoolVal as AstBool, DeclKind, DestructurePattern, Expr, FnBody, Lifetime,
+    Program, Stmt, StrPart, TimeKind, UnaryOp,
 };
 use crate::diagnostic::{Diagnostic, Label};
 use crate::env::{self, Binding, Scope};
 use crate::source::{SourceFile, Span};
-use crate::value::{fresh_id, BoolVal, BuiltinFn, Class, ClassMethod, Function, Instance, Object, Value};
+use crate::value::{
+    fresh_id, BoolVal, BuiltinFn, Class, ClassMethod, Function, Instance, Object, Signal, Value,
+};
 
 /// Public outcome of running a program.
 #[derive(Debug, Default)]
@@ -47,6 +50,38 @@ pub struct Interpreter {
     /// Source text of the file currently being run (set in `run_file`), so
     /// that `?` debug-prints can quote the original expression.
     pub(crate) current_source: Option<Rc<String>>,
+    /// Statements of the file currently being run, kept live so that `next x`
+    /// can scan forward for upcoming assignments and `reverse!` can mutate
+    /// the remaining slice.
+    pub(crate) current_file_stmts: Rc<RefCell<Vec<Stmt>>>,
+    /// 0-based index into [`Self::current_file_stmts`] of the statement that
+    /// is currently executing.
+    pub(crate) current_stmt_index: usize,
+    /// Name of the file currently being run, for routing imports.
+    pub(crate) current_file_name: Option<String>,
+    /// Async tasks queued by un-`await`-ed calls to async functions; ticked
+    /// one statement per main-thread statement.
+    pub(crate) pending_async: Vec<AsyncTask>,
+    /// Re-entrancy depth of `await`. While > 0, async function calls are run
+    /// synchronously and return their result directly.
+    pub(crate) in_await: u32,
+    /// Set by `reverse!`; the file driver flips the remaining statements when
+    /// it sees this set.
+    pub(crate) reverse_pending: bool,
+    /// `export <name> to "<file>"!` deposits values here; `import <name>!`
+    /// pulls them from the entry keyed by the importer's file name.
+    pub(crate) exports: HashMap<String, HashMap<String, Value>>,
+}
+
+/// A queued async function call. Each entry represents an in-flight task
+/// whose body has not yet been fully executed.
+#[derive(Debug)]
+pub struct AsyncTask {
+    pub stmts: Vec<Stmt>,
+    pub index: usize,
+    pub scope: Scope,
+    pub done: bool,
+    pub result: Value,
 }
 
 #[derive(Debug)]
@@ -73,6 +108,13 @@ impl Interpreter {
             deleted: Vec::new(),
             watchers: Vec::new(),
             current_source: None,
+            current_file_stmts: Rc::new(RefCell::new(Vec::new())),
+            current_stmt_index: 0,
+            current_file_name: None,
+            pending_async: Vec::new(),
+            in_await: 0,
+            reverse_pending: false,
+            exports: HashMap::new(),
         };
         builtins::install(&mut interp);
         interp
@@ -105,6 +147,8 @@ impl Interpreter {
     }
 
     fn run_file(&mut self, file: &crate::ast::File) -> Result<(), Diagnostic> {
+        self.current_file_name = file.name.clone();
+        self.current_file_stmts = Rc::new(RefCell::new(file.stmts.clone()));
         // Two-pass: first, hoist negative-lifetime declarations so that they
         // are visible *before* their physical position in the file.
         for (i, stmt) in file.stmts.iter().enumerate() {
@@ -118,21 +162,38 @@ impl Interpreter {
                 }
             }
         }
-        for (i, stmt) in file.stmts.iter().enumerate() {
-            self.line = i + 1;
-            // Skip negative-lifetime declarations (already hoisted).
-            if let Stmt::Let {
-                lifetime: Some(Lifetime::Lines(n)),
-                ..
-            } = stmt
-            {
-                if *n < 0 {
-                    continue;
-                }
+        let mut i = 0usize;
+        loop {
+            let len = self.current_file_stmts.borrow().len();
+            if i >= len {
+                break;
             }
-            self.exec_stmt(stmt, &Rc::clone(&self.globals))?;
-            self.run_watchers()?;
+            self.line = i + 1;
+            self.current_stmt_index = i;
+            let stmt = self.current_file_stmts.borrow()[i].clone();
+            // Skip negative-lifetime declarations (already hoisted).
+            let is_hoisted = matches!(
+                &stmt,
+                Stmt::Let {
+                    lifetime: Some(Lifetime::Lines(n)),
+                    ..
+                } if *n < 0,
+            );
+            if !is_hoisted {
+                self.exec_stmt(&stmt, &Rc::clone(&self.globals))?;
+                self.run_watchers()?;
+                self.tick_async()?;
+            }
+            if self.reverse_pending {
+                self.reverse_pending = false;
+                let mut stmts = self.current_file_stmts.borrow_mut();
+                let tail: Vec<Stmt> = stmts.split_off(i + 1);
+                let reversed: Vec<Stmt> = tail.into_iter().rev().collect();
+                stmts.extend(reversed);
+            }
+            i += 1;
         }
+        self.drain_async()?;
         Ok(())
     }
 
@@ -205,6 +266,7 @@ impl Interpreter {
                         created_at: Instant::now(),
                         lifetime: None,
                         eternal: false,
+                        previous_value: None,
                     },
                 );
                 let _ = span;
@@ -214,11 +276,20 @@ impl Interpreter {
             Stmt::When { cond, block, span } => {
                 self.install_watcher(cond, block.clone(), *span, scope)
             }
-            Stmt::Reverse { .. } | Stmt::Export { .. } | Stmt::Import { .. } => {
-                // Reverse / export / import are accepted but no-ops in this
-                // single-file build of the interpreter.
+            Stmt::Reverse { .. } => {
+                // Mark for the file driver: the remaining statements after
+                // this one are flipped end-to-end, so the program "runs
+                // forwards through what it has, then backwards through the
+                // rest." (We can't reverse what already happened.)
+                self.reverse_pending = true;
                 Ok(())
             }
+            Stmt::Export {
+                name,
+                target_file,
+                span,
+            } => self.exec_export(name, target_file, *span, scope),
+            Stmt::Import { name, span } => self.exec_import(name, *span, scope),
             Stmt::FnDecl {
                 is_async,
                 name,
@@ -245,6 +316,7 @@ impl Interpreter {
                         created_at: Instant::now(),
                         lifetime: None,
                         eternal: false,
+                        previous_value: None,
                     },
                 );
                 let _ = span;
@@ -313,11 +385,22 @@ impl Interpreter {
                         created_at: Instant::now(),
                         lifetime: lifetime.clone(),
                         eternal,
+                        previous_value: None,
                     },
                 );
             }
-            BindingTarget::Destructure { .. } => {
-                return Err(self.todo("destructuring", *span));
+            BindingTarget::Destructure { pattern, .. } => {
+                self.bind_destructure(
+                    pattern,
+                    v,
+                    scope,
+                    *decl,
+                    *priority,
+                    line,
+                    lifetime.clone(),
+                    eternal,
+                    *span,
+                )?;
             }
         }
         Ok(())
@@ -381,8 +464,124 @@ impl Interpreter {
                 index,
                 span,
             } => self.eval_index(target, index, *span, scope),
-            other => Err(self.todo("expression", other.span())),
+            Expr::UseSignal { initial, span } => self.eval_use_signal(initial, *span, scope),
+            Expr::Time {
+                when,
+                target,
+                span,
+            } => self.eval_time(*when, target, *span, scope),
+            Expr::Await { target, .. } => self.eval_await(target, scope),
+            Expr::Lambda {
+                is_async,
+                params,
+                body,
+                span: _,
+            } => Ok(Value::Function(Rc::new(Function {
+                name: "<lambda>".to_string(),
+                is_async: *is_async,
+                params: params.clone(),
+                body: (**body).clone(),
+                captured: Rc::clone(scope),
+            }))),
         }
+    }
+
+    fn eval_use_signal(
+        &mut self,
+        initial: &Expr,
+        _span: Span,
+        scope: &Scope,
+    ) -> Result<Value, Diagnostic> {
+        let init = self.eval_expr(initial, scope)?;
+        let signal = Rc::new(RefCell::new(Signal { current: init }));
+        Ok(Value::Signal(signal, fresh_id()))
+    }
+
+    fn eval_time(
+        &mut self,
+        when: TimeKind,
+        target: &Expr,
+        span: Span,
+        scope: &Scope,
+    ) -> Result<Value, Diagnostic> {
+        match when {
+            TimeKind::Current => self.eval_expr(target, scope),
+            TimeKind::Previous => match target {
+                Expr::Ident { name, .. } => {
+                    let prev =
+                        env::lookup_previous(scope, name, self.line, self.start_time);
+                    if let Some(v) = prev {
+                        return Ok(v);
+                    }
+                    // No reassignment yet — fall back to the current value.
+                    self.eval_expr(target, scope)
+                }
+                _ => Err(Diagnostic::error("`previous` requires a name")
+                    .with_code("E0900")
+                    .with_label(Label::primary(
+                        span,
+                        "expected an identifier after `previous`",
+                    ))),
+            },
+            TimeKind::Next => match target {
+                Expr::Ident { name, .. } => {
+                    if let Some(v) = self.peek_next_assignment(name, scope)? {
+                        return Ok(v);
+                    }
+                    self.eval_expr(target, scope)
+                }
+                _ => Err(Diagnostic::error("`next` requires a name")
+                    .with_code("E0901")
+                    .with_label(Label::primary(
+                        span,
+                        "expected an identifier after `next`",
+                    ))),
+            },
+        }
+    }
+
+    /// Scan forward in the current file for the next assignment-or-redeclaration
+    /// of `name`, then evaluate that statement's RHS in `scope`. Returns
+    /// `None` if no such future write exists.
+    fn peek_next_assignment(
+        &mut self,
+        name: &str,
+        scope: &Scope,
+    ) -> Result<Option<Value>, Diagnostic> {
+        let stmts = Rc::clone(&self.current_file_stmts);
+        let stmts_ref = stmts.borrow();
+        let start = self.current_stmt_index + 1;
+        for s in stmts_ref.iter().skip(start) {
+            match s {
+                Stmt::Assign {
+                    target: Expr::Ident { name: n, .. },
+                    value,
+                    ..
+                } if n == name => {
+                    let value = value.clone();
+                    drop(stmts_ref);
+                    return self.eval_expr(&value, scope).map(Some);
+                }
+                Stmt::Let {
+                    target: BindingTarget::Ident { name: n, .. },
+                    value,
+                    ..
+                } if n == name => {
+                    let value = value.clone();
+                    drop(stmts_ref);
+                    return self.eval_expr(&value, scope).map(Some);
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    fn eval_await(&mut self, target: &Expr, scope: &Scope) -> Result<Value, Diagnostic> {
+        self.in_await += 1;
+        let v = self.eval_expr(target, scope);
+        self.in_await -= 1;
+        v
     }
 
     fn eval_string_parts(&mut self, parts: &[StrPart], scope: &Scope) -> Result<Value, Diagnostic> {
@@ -519,6 +718,14 @@ impl Interpreter {
         match f {
             Value::BuiltinFn(bf) => (bf.call)(self, vs, span),
             Value::Function(func) => self.invoke_user_fn(&func, vs, span),
+            Value::Signal(sig, _) => {
+                if vs.is_empty() {
+                    Ok(sig.borrow().current.clone())
+                } else {
+                    sig.borrow_mut().current = vs.into_iter().next().unwrap();
+                    Ok(Value::Undefined)
+                }
+            }
             Value::String(_, _) => Err(Diagnostic::error("cannot call a string as a function")
                 .with_code("E0400")
                 .with_label(Label::primary(
@@ -545,7 +752,7 @@ impl Interpreter {
         &mut self,
         func: &Rc<Function>,
         args: Vec<Value>,
-        _span: Span,
+        span: Span,
     ) -> Result<Value, Diagnostic> {
         let call_scope = env::child_scope(&func.captured);
         for (i, p) in func.params.iter().enumerate() {
@@ -561,12 +768,34 @@ impl Interpreter {
                     created_at: Instant::now(),
                     lifetime: None,
                     eternal: false,
+                    previous_value: None,
                 },
             );
         }
+        if func.is_async && self.in_await == 0 {
+            // Line-interleaved execution: the body becomes a queue of
+            // statements that ticks one step per main-thread statement.
+            // We don't have a Promise type, so the un-awaited call simply
+            // returns `undefined` and the body runs in the background.
+            let stmts = match &func.body {
+                FnBody::Expr(e) => vec![Stmt::Return {
+                    value: Some(e.clone()),
+                    span,
+                }],
+                FnBody::Block(b) => b.stmts.clone(),
+            };
+            self.pending_async.push(AsyncTask {
+                stmts,
+                index: 0,
+                scope: call_scope,
+                done: false,
+                result: Value::Undefined,
+            });
+            return Ok(Value::Undefined);
+        }
         match &func.body {
-            crate::ast::FnBody::Expr(e) => self.eval_expr(e, &call_scope),
-            crate::ast::FnBody::Block(b) => match self.exec_block(b, &call_scope) {
+            FnBody::Expr(e) => self.eval_expr(e, &call_scope),
+            FnBody::Block(b) => match self.exec_block(b, &call_scope) {
                 Ok(()) => Ok(Value::Undefined),
                 Err(d) if is_return_signal(&d) => Ok(unwrap_return_value(d)),
                 Err(d) => Err(d),
@@ -953,6 +1182,7 @@ impl Interpreter {
                                 created_at: Instant::now(),
                                 lifetime: None,
                                 eternal: false,
+                                previous_value: None,
                             },
                         );
                         return Ok(());
@@ -993,6 +1223,7 @@ impl Interpreter {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn todo(&self, what: &str, span: Span) -> Diagnostic {
         Diagnostic::error(format!("{what} not yet implemented in the interpreter"))
             .with_label(Label::primary(span, "encountered here"))
@@ -1001,6 +1232,240 @@ impl Interpreter {
                  that part of the language yet.",
             )
     }
+
+    /// Bind a `[a, b, ...]` pattern. The right-hand side is either a `Signal`
+    /// (in which case the canonical `[get, set]` shape is materialised as a
+    /// pair of closures over the signal cell), or a structurally compatible
+    /// `Array` (which is unpacked element-wise).
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::self_only_used_in_recursion,
+        clippy::only_used_in_recursion
+    )]
+    fn bind_destructure(
+        &mut self,
+        pattern: &DestructurePattern,
+        value: Value,
+        scope: &Scope,
+        decl: DeclKind,
+        priority: i32,
+        line: usize,
+        lifetime: Option<Lifetime>,
+        eternal: bool,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        match pattern {
+            DestructurePattern::Ident(name, _) => {
+                env::insert(
+                    scope,
+                    Binding {
+                        name: name.clone(),
+                        value,
+                        decl,
+                        priority,
+                        created_line: line,
+                        created_at: Instant::now(),
+                        lifetime,
+                        eternal,
+                        previous_value: None,
+                    },
+                );
+                Ok(())
+            }
+            DestructurePattern::List(items, _) => {
+                // Signal-pair form: `[getter, setter] = use(initial)`.
+                if let Value::Signal(sig, _) = &value {
+                    if items.len() == 2 {
+                        let (get, set) = signal_accessors(Rc::clone(sig));
+                        self.bind_destructure(
+                            &items[0],
+                            get,
+                            scope,
+                            decl,
+                            priority,
+                            line,
+                            lifetime.clone(),
+                            eternal,
+                            span,
+                        )?;
+                        self.bind_destructure(
+                            &items[1],
+                            set,
+                            scope,
+                            decl,
+                            priority,
+                            line,
+                            lifetime,
+                            eternal,
+                            span,
+                        )?;
+                        return Ok(());
+                    }
+                }
+                // Array form: structural unpack, missing slots become `undefined`.
+                let arr = match &value {
+                    Value::Array(a, _) => Some(Rc::clone(a)),
+                    _ => None,
+                };
+                for (i, item) in items.iter().enumerate() {
+                    let v = match &arr {
+                        Some(a) => a
+                            .borrow()
+                            .get(i)
+                            .cloned()
+                            .unwrap_or(Value::Undefined),
+                        None => {
+                            // Single-slot list around a non-array value: just
+                            // bind the value directly to the inner pattern.
+                            if items.len() == 1 {
+                                value.clone()
+                            } else {
+                                Value::Undefined
+                            }
+                        }
+                    };
+                    self.bind_destructure(
+                        item,
+                        v,
+                        scope,
+                        decl,
+                        priority,
+                        line,
+                        lifetime.clone(),
+                        eternal,
+                        span,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Advance every pending async task by one statement. Removes tasks that
+    /// have run their last statement (or returned).
+    pub(crate) fn tick_async(&mut self) -> Result<(), Diagnostic> {
+        let n = self.pending_async.len();
+        for i in 0..n {
+            if i >= self.pending_async.len() || self.pending_async[i].done {
+                continue;
+            }
+            let stmt;
+            let scope;
+            {
+                let task = &mut self.pending_async[i];
+                if task.index >= task.stmts.len() {
+                    task.done = true;
+                    continue;
+                }
+                stmt = task.stmts[task.index].clone();
+                task.index += 1;
+                scope = Rc::clone(&task.scope);
+            }
+            match self.exec_stmt(&stmt, &scope) {
+                Ok(()) => {}
+                Err(d) if is_return_signal(&d) => {
+                    let result = unwrap_return_value(d);
+                    if let Some(task) = self.pending_async.get_mut(i) {
+                        task.result = result;
+                        task.done = true;
+                    }
+                }
+                Err(d) => return Err(d),
+            }
+        }
+        self.pending_async.retain(|t| !t.done);
+        Ok(())
+    }
+
+    /// Run all pending async tasks to completion. Used between files and
+    /// after the main thread of a file has exhausted its statements.
+    pub(crate) fn drain_async(&mut self) -> Result<(), Diagnostic> {
+        while !self.pending_async.is_empty() {
+            self.tick_async()?;
+        }
+        Ok(())
+    }
+
+    fn exec_export(
+        &mut self,
+        name: &str,
+        target_file: &str,
+        span: Span,
+        scope: &Scope,
+    ) -> Result<(), Diagnostic> {
+        let v = match env::lookup(scope, name, self.line, self.start_time) {
+            Some(v) => v,
+            None => {
+                return Err(Diagnostic::error(format!("cannot export `{name}`: not in scope"))
+                    .with_code("E0950")
+                    .with_label(Label::primary(span, "no such binding to export")));
+            }
+        };
+        self.exports
+            .entry(target_file.to_string())
+            .or_default()
+            .insert(name.to_string(), v);
+        Ok(())
+    }
+
+    fn exec_import(&mut self, name: &str, span: Span, scope: &Scope) -> Result<(), Diagnostic> {
+        let file_name = self.current_file_name.as_deref().unwrap_or("");
+        let value = self
+            .exports
+            .get(file_name)
+            .and_then(|m| m.get(name))
+            .cloned();
+        let Some(value) = value else {
+            return Err(Diagnostic::error(format!(
+                "cannot import `{name}`: nothing exports it to `{file_name}`"
+            ))
+            .with_code("E0951")
+            .with_label(Label::primary(span, "no matching export"))
+            .with_note(
+                "another file in this program must run `export <name> to \"<this file>\"!` \
+                 before the import sees it.",
+            ));
+        };
+        env::insert(
+            scope,
+            Binding {
+                name: name.to_string(),
+                value,
+                decl: DeclKind::ConstConst,
+                priority: 0,
+                created_line: self.line,
+                created_at: Instant::now(),
+                lifetime: None,
+                eternal: false,
+                previous_value: None,
+            },
+        );
+        Ok(())
+    }
+}
+
+/// Build a getter and setter function for the given signal cell. Used by
+/// destructured signal bindings: `[getScore, setScore] = use(0)`.
+fn signal_accessors(sig: Rc<RefCell<Signal>>) -> (Value, Value) {
+    let read = Rc::clone(&sig);
+    let getter = BuiltinFn {
+        name: "<signal getter>",
+        call: Box::new(move |_interp, _args, _span| Ok(read.borrow().current.clone())),
+    };
+    let write = Rc::clone(&sig);
+    let setter = BuiltinFn {
+        name: "<signal setter>",
+        call: Box::new(move |_interp, args, _span| {
+            if let Some(v) = args.into_iter().next() {
+                write.borrow_mut().current = v;
+            }
+            Ok(Value::Undefined)
+        }),
+    };
+    (
+        Value::BuiltinFn(Rc::new(getter)),
+        Value::BuiltinFn(Rc::new(setter)),
+    )
 }
 
 fn is_mutating_method(name: &str) -> bool {
