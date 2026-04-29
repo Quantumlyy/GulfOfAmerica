@@ -934,3 +934,188 @@ print(nope)!
         &["import", "nope"],
     );
 }
+
+// ---------------------------------------------------------------------------
+// § std http — `import http!` binds a module with client + server primitives.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn http_module_binds_via_stdlib_import() {
+    // Even with no `=====`-separated peer file exporting `http`, the import
+    // succeeds because `http` is a known std package.
+    let src = r#"
+import http!
+print(http.get)!
+"#;
+    let s = out(src);
+    assert!(
+        s.contains("builtin"),
+        "expected http.get to be a builtin function, got: {s:?}"
+    );
+}
+
+#[test]
+fn http_unknown_std_name_still_errors() {
+    // `nope` is not in the stdlib registry, so the error should match the
+    // pre-existing missing-export diagnostic.
+    err_contains(
+        r#"
+import nope!
+"#,
+        &["import", "nope"],
+    );
+}
+
+#[test]
+fn http_user_export_shadows_stdlib() {
+    // If a peer file exports a binding called `http`, the user wins. This
+    // keeps the stdlib registry from quietly stealing user names.
+    let src = r#"
+const const http = "the user value"!
+export http to "main.gom"!
+===== main.gom =====
+import http!
+print(http)!
+"#;
+    assert_eq!(out(src), "the user value\n");
+}
+
+#[test]
+fn http_serve_once_roundtrip() {
+    // End-to-end smoke test: spawn a real serve_once on a free port, fire a
+    // GET at it from a Rust client thread, assert the response.
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+    use std::time::Duration;
+
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+
+    let src = format!(
+        r#"
+import http!
+function handle(req) => {{
+   return {{status: 201, body: "got " + req.method + " " + req.path}}!
+}}
+http.serve_once("127.0.0.1:{port}", handle)!
+print("done")!
+"#
+    );
+
+    let server = thread::spawn(move || gulf::run(&src, "server.gom"));
+
+    // Give the server a moment to bind. We retry the connect a few times to
+    // tolerate the small race between bind and accept.
+    let mut stream = None;
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+            stream = Some(s);
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut stream = stream.expect("could not connect to test server");
+    stream
+        .write_all(b"GET /spec HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 201"), "response: {response}");
+    assert!(response.contains("got GET /spec"), "response: {response}");
+
+    let server_out = server.join().unwrap().expect("server program failed");
+    assert!(server_out.contains("done\n"), "server output: {server_out:?}");
+}
+
+#[test]
+fn http_client_get_against_local_listener() {
+    // The mirror of the previous test: spin up a *Rust* TCP listener that
+    // serves a canned response, then drive `http.get` from inside the
+    // interpreter and confirm the parsed shape.
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        let body = "pong";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let src = format!(
+        r#"
+import http!
+const const res = http.get("http://127.0.0.1:{port}/")!
+print(res.status)!
+print(res.body)!
+print(res.headers["content-type"])!
+"#
+    );
+    let s = out(&src);
+    server.join().unwrap();
+
+    assert_eq!(s, "200\npong\ntext/plain\n");
+}
+
+#[test]
+fn http_post_sends_body() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let received = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        stream.write_all(response.as_bytes()).unwrap();
+        received
+    });
+
+    let src = format!(
+        r#"
+import http!
+const const res = http.post("http://127.0.0.1:{port}/echo", "payload-123")!
+print(res.body)!
+"#
+    );
+    let s = out(&src);
+    let received = server.join().unwrap();
+
+    assert_eq!(s, "ok\n");
+    assert!(
+        received.starts_with("POST /echo HTTP/1.1\r\n"),
+        "wire: {received}"
+    );
+    assert!(received.contains("Content-Length: 11"), "wire: {received}");
+    assert!(received.ends_with("payload-123"), "wire: {received}");
+}
+
+#[test]
+fn http_get_rejects_https_urls() {
+    err_contains(
+        r#"
+import http!
+http.get("https://example.com")!
+"#,
+        &["only http://"],
+    );
+}
