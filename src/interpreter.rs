@@ -24,7 +24,7 @@ use crate::ast::{
 use crate::diagnostic::{Diagnostic, Label};
 use crate::env::{self, Binding, Scope};
 use crate::source::{SourceFile, Span};
-use crate::value::{fresh_id, BoolVal, BuiltinFn, Object, Value};
+use crate::value::{fresh_id, BoolVal, BuiltinFn, Function, Object, Value};
 
 /// Public outcome of running a program.
 #[derive(Debug, Default)]
@@ -144,6 +144,58 @@ impl Interpreter {
                 priority: _,
                 span,
             } => self.exec_assign(target, value, *span, scope),
+            Stmt::FnDecl {
+                is_async,
+                name,
+                params,
+                body,
+                priority,
+                span,
+            } => {
+                let func = Value::Function(Rc::new(Function {
+                    name: name.clone(),
+                    is_async: *is_async,
+                    params: params.clone(),
+                    body: body.clone(),
+                    captured: Rc::clone(scope),
+                }));
+                env::insert(
+                    scope,
+                    Binding {
+                        name: name.clone(),
+                        value: func,
+                        decl: DeclKind::ConstConst,
+                        priority: *priority,
+                        created_line: self.line,
+                        created_at: Instant::now(),
+                        lifetime: None,
+                        eternal: false,
+                    },
+                );
+                let _ = span;
+                Ok(())
+            }
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+                span: _,
+            } => {
+                let c = self.eval_expr(cond, scope)?;
+                if truthy(&c) {
+                    self.exec_block(then_block, scope)?;
+                } else if let Some(else_block) = else_block {
+                    self.exec_block(else_block, scope)?;
+                }
+                Ok(())
+            }
+            Stmt::Return { value, span } => {
+                let v = match value {
+                    Some(e) => self.eval_expr(e, scope)?,
+                    None => Value::Undefined,
+                };
+                Err(return_signal(v, *span))
+            }
             other => Err(self.todo(
                 &format!("statement kind {:?}", std::mem::discriminant(other)),
                 stmt_span(other),
@@ -310,14 +362,29 @@ impl Interpreter {
         for a in args {
             vs.push(self.eval_expr(a, scope)?);
         }
+        self.invoke(f, vs, callee, span)
+    }
+
+    pub(crate) fn invoke(
+        &mut self,
+        f: Value,
+        vs: Vec<Value>,
+        callee: &Expr,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
         match f {
             Value::BuiltinFn(bf) => (bf.call)(self, vs, span),
+            Value::Function(func) => self.invoke_user_fn(&func, vs, span),
             Value::String(_, _) => Err(Diagnostic::error("cannot call a string as a function")
                 .with_code("E0400")
                 .with_label(Label::primary(
                     callee.span(),
                     "this evaluated to a string, not a function",
-                ))),
+                ))
+                .with_note(
+                    "undeclared identifiers in Gulf of Mexico evaluate to a bareword string \
+                     of their own name. Maybe the function isn't defined yet?",
+                )),
             other => Err(Diagnostic::error(format!(
                 "cannot call a {} as a function",
                 other.type_name()
@@ -328,6 +395,51 @@ impl Interpreter {
                 "this is not a function",
             ))),
         }
+    }
+
+    fn invoke_user_fn(
+        &mut self,
+        func: &Rc<Function>,
+        args: Vec<Value>,
+        _span: Span,
+    ) -> Result<Value, Diagnostic> {
+        let call_scope = env::child_scope(&func.captured);
+        for (i, p) in func.params.iter().enumerate() {
+            let v = args.get(i).cloned().unwrap_or(Value::Undefined);
+            env::insert(
+                &call_scope,
+                Binding {
+                    name: p.name.clone(),
+                    value: v,
+                    decl: DeclKind::VarVar,
+                    priority: 0,
+                    created_line: self.line,
+                    created_at: Instant::now(),
+                    lifetime: None,
+                    eternal: false,
+                },
+            );
+        }
+        match &func.body {
+            crate::ast::FnBody::Expr(e) => self.eval_expr(e, &call_scope),
+            crate::ast::FnBody::Block(b) => match self.exec_block(b, &call_scope) {
+                Ok(()) => Ok(Value::Undefined),
+                Err(d) if is_return_signal(&d) => Ok(unwrap_return_value(d)),
+                Err(d) => Err(d),
+            },
+        }
+    }
+
+    pub(crate) fn exec_block(
+        &mut self,
+        block: &crate::ast::Block,
+        scope: &Scope,
+    ) -> Result<(), Diagnostic> {
+        let inner = env::child_scope(scope);
+        for s in &block.stmts {
+            self.exec_stmt(s, &inner)?;
+        }
+        Ok(())
     }
 
     fn eval_unary(
@@ -639,6 +751,33 @@ fn stmt_span(s: &Stmt) -> Span {
 
 #[allow(dead_code)]
 fn _used_in_later_commits(_: DeclKind, _: &mut BuiltinFn) {}
+
+// ===========================================================================
+// "Return" is signalled via a sentinel diagnostic so we can unwind through
+// arbitrary block nesting cheaply. The sentinel uses an unreachable error
+// code that no real diagnostic emits.
+// ===========================================================================
+
+const RETURN_SIGNAL_CODE: &str = "__gulf_return__";
+
+thread_local! {
+    static RETURN_VALUE: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+fn return_signal(v: Value, span: Span) -> Diagnostic {
+    RETURN_VALUE.with(|cell| *cell.borrow_mut() = Some(v));
+    Diagnostic::error("internal: return")
+        .with_code(RETURN_SIGNAL_CODE)
+        .with_label(Label::primary(span, ""))
+}
+
+fn is_return_signal(d: &Diagnostic) -> bool {
+    d.code == Some(RETURN_SIGNAL_CODE)
+}
+
+fn unwrap_return_value(_d: Diagnostic) -> Value {
+    RETURN_VALUE.with(|cell| cell.borrow_mut().take().unwrap_or(Value::Undefined))
+}
 
 // ===========================================================================
 // Equality, arithmetic, and value-coercion helpers.
