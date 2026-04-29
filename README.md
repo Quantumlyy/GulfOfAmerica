@@ -99,6 +99,31 @@ function handle(req) => { return {status: 200, body: "hi " + req.path}! }
 http.serve_once("127.0.0.1:8765", handle)!
 ```
 
+## Editor support (LSP)
+
+`gulf-lsp` is a Language Server for `.gom` files. It is feature-gated so the
+core interpreter stays dependency-free:
+
+```sh
+cargo build --release --features lsp --bin gulf-lsp
+# or:
+cargo install --path . --features lsp
+```
+
+Then point your editor at the `gulf-lsp` binary as the language server for
+`gulf` / `dreamberd` / `*.gom`. Capabilities in v0:
+
+- **Diagnostics** on open/change/save — lex + parse errors, with codes and
+  notes preserved.
+- **Hover** for keywords, builtins, and the `http` std package.
+- **Document symbols** for top-level `function` / `class` / `let`s, with
+  class fields and methods nested as children.
+- **Goto-definition** for identifiers that resolve to a top-level binding
+  in the same file.
+
+Completion, semantic tokens, and formatting are intentionally out of scope
+for the first cut.
+
 ## Architecture
 
 ```text
@@ -119,6 +144,9 @@ src/
 │   ├── builtins.rs   default globals (`print`, …)
 │   └── stdlib/       packages reachable via `import <name>!`
 │       └── http.rs   HTTP/1.1 client + server primitives
+├── lsp.rs            Language Server (feature = "lsp")
+├── bin/
+│   └── gulf-lsp.rs   thin stdio entry point for `gulf-lsp`
 └── main.rs           CLI: run / check / tokens / parse subcommands
 ```
 
@@ -128,7 +156,8 @@ under `#![forbid(unsafe_code)]`.
 ## Tests
 
 ```sh
-cargo test            # 118 tests: 33 unit + 78 spec + 7 http
+cargo test                     # 118: 33 unit + 78 spec + 7 http
+cargo test --features lsp      # adds 11 lsp tests
 cargo clippy --all-targets
 ```
 

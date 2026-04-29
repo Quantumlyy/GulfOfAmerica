@@ -19,6 +19,22 @@ path = "src/lib.rs"
 name = "gulf"
 path = "src/main.rs"
 
+[[bin]]
+name = "gulf-lsp"
+path = "src/bin/gulf-lsp.rs"
+required-features = ["lsp"]
+
+[features]
+default = []
+# Pulls in the language-server binary `gulf-lsp`. Off by default to keep the
+# core library / interpreter dependency-free.
+lsp = ["dep:tower-lsp", "dep:tokio", "dep:serde_json"]
+
+[dependencies]
+tower-lsp = { version = "0.20", optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"], optional = true }
+serde_json = { version = "1", optional = true }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

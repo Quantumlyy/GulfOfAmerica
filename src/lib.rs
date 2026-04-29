@@ -13,6 +13,8 @@ pub mod diagnostic;
 pub mod env;
 pub mod interpreter;
 pub mod lexer;
+#[cfg(feature = "lsp")]
+pub mod lsp;
 pub mod parser;
 pub mod source;
 pub mod token;
