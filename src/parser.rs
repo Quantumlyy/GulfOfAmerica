@@ -136,6 +136,127 @@ mod tests {
     }
 
     #[test]
+    fn parses_const_const_declaration() {
+        let p = parse_str(r#"const const x = 5!"#).unwrap();
+        let s = &p.files[0].stmts[0];
+        match s {
+            crate::ast::Stmt::Let { decl, const_depth, priority, .. } => {
+                assert_eq!(*decl, crate::ast::DeclKind::ConstConst);
+                assert_eq!(*const_depth, 2);
+                assert_eq!(*priority, 1);
+            }
+            other => panic!("expected Let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_const_const_const_declaration() {
+        let p = parse_str(r#"const const const pi = 3.14!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { const_depth, .. } => assert_eq!(*const_depth, 3),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_var_var_declaration() {
+        let p = parse_str(r#"var var x = 5!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { decl, .. } => {
+                assert_eq!(*decl, crate::ast::DeclKind::VarVar);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_lifetime_lines() {
+        let p = parse_str(r#"const const x<2> = 5!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { lifetime, .. } => {
+                assert!(matches!(lifetime, Some(crate::ast::Lifetime::Lines(2))));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_lifetime_negative_for_hoisting() {
+        let p = parse_str(r#"const const x<-1> = 5!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { lifetime, .. } => {
+                assert!(matches!(lifetime, Some(crate::ast::Lifetime::Lines(-1))));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_lifetime_seconds() {
+        let p = parse_str(r#"const const x<20s> = 5!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { lifetime, .. } => match lifetime {
+                Some(crate::ast::Lifetime::Seconds(s)) => assert!((*s - 20.0).abs() < 1e-9),
+                other => panic!("expected seconds, got {other:?}"),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_lifetime_infinity() {
+        let p = parse_str(r#"const const x<Infinity> = 5!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { lifetime, .. } => {
+                assert!(matches!(lifetime, Some(crate::ast::Lifetime::Infinity)));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_priority_from_bang_count() {
+        let p = parse_str(r#"const const x = 5!!!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { priority, .. } => assert_eq!(*priority, 3),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_negative_priority_from_inverted_bang() {
+        let p = parse_str(r#"const const x = 5¡"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { priority, .. } => assert_eq!(*priority, -1),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_redefining_a_number_literal_as_a_name() {
+        let p = parse_str(r#"const const 5 = 4!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { target, .. } => match target {
+                crate::ast::BindingTarget::Ident { name, .. } => assert_eq!(name, "5"),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_destructured_signal_binding() {
+        let p = parse_str(r#"const var [getScore, setScore] = use(0)!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Let { target, .. } => match target {
+                crate::ast::BindingTarget::Destructure { .. } => {}
+                _ => panic!(),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
     fn parses_file_separator() {
         let src = r#"
 print("a")!
