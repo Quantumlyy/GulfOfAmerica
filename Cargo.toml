@@ -1,0 +1,44 @@
+[package]
+name = "gulf-of-america"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Nejc Drobnic <nejc@nejc.dev>"]
+description = "An interpreter (and a little bit of a compiler) for TodePond's Gulf of Mexico / DreamBerd, the perfect programming language."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/quantumlyy/gulfofamerica"
+keywords = ["interpreter", "language", "dreamberd", "gulfofmexico", "esolang"]
+categories = ["compilers", "command-line-utilities"]
+
+[lib]
+name = "gulf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gulf"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+# A few pedantic lints are too noisy for an interpreter.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+similar_names = "allow"
