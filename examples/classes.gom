@@ -1,0 +1,21 @@
+// One instance per class, ever.
+class Player {
+   const var health = 10!
+}
+
+const var player1 = new Player()!
+print(player1.health)!  // 10
+
+// Workaround: factory class.
+class PlayerMaker {
+   function makePlayer() => {
+      class Pawn {
+         const var health = 5!
+      }
+      const const pawn = new Pawn()!
+      return pawn!
+   }
+}
+const const maker = new PlayerMaker()!
+const var pawn = maker.makePlayer()!
+print(pawn.health)!  // 5

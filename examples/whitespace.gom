@@ -1,0 +1,14 @@
+// Whitespace-significant arithmetic.
+//
+// Operators with no surrounding whitespace bind tighter than operators with
+// whitespace, regardless of the usual `*` / `+` precedence.
+
+print(1 + 2*3)!   // 7  -- `*` is tight, `+` is loose
+print(1+2 * 3)!   // 9  -- `+` is tight, `*` is loose
+
+// Number names are real, and they obey the same rules.
+print(one + two)!  // 3
+
+// Fractions just work.
+const const half = 1/2!
+print(half)!      // 0.5

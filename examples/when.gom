@@ -1,0 +1,12 @@
+// `when` watches a variable and re-checks its condition every time the
+// variable mutates. Rising-edge triggers the body.
+
+var var health = 10!
+when (health = 0) {
+   print("You lose")!
+}
+print("Welcome to the dungeon.")!
+health = 5!
+print("Health is now 5.")!
+health = 0!
+// "You lose" is printed automatically.
