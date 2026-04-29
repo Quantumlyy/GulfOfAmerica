@@ -81,6 +81,22 @@ pub enum TokenKind {
     Slash,
     /// `%`
     Percent,
+    /// `^` — exponentiation.
+    Caret,
+    /// `.`
+    Dot,
+    /// `++`
+    PlusPlus,
+    /// `--`
+    MinusMinus,
+    /// `+=`
+    PlusEq,
+    /// `-=`
+    MinusEq,
+    /// `*=`
+    StarEq,
+    /// `/=`
+    SlashEq,
     /// `;` — the **not** prefix.
     Semi,
     /// `=` repeated `n` times, where `1 <= n <= 4`. n=1 is also assignment.
@@ -183,6 +199,14 @@ impl TokenKind {
             TokenKind::Star => "`*`".into(),
             TokenKind::Slash => "`/`".into(),
             TokenKind::Percent => "`%`".into(),
+            TokenKind::Caret => "`^`".into(),
+            TokenKind::Dot => "`.`".into(),
+            TokenKind::PlusPlus => "`++`".into(),
+            TokenKind::MinusMinus => "`--`".into(),
+            TokenKind::PlusEq => "`+=`".into(),
+            TokenKind::MinusEq => "`-=`".into(),
+            TokenKind::StarEq => "`*=`".into(),
+            TokenKind::SlashEq => "`/=`".into(),
             TokenKind::Semi => "`;` (the not prefix)".into(),
             TokenKind::Eq(n) => format!("`{}`", "=".repeat(*n as usize)),
             TokenKind::FileSeparator => "file separator (`=====`+)".into(),

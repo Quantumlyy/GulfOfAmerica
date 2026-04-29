@@ -702,8 +702,13 @@ fn diagnostic_unterminated_string_points_at_the_open_quote() {
 }
 
 #[test]
-fn diagnostic_unknown_variable() {
-    err_contains(r#"print(unknown_thing)!"#, &["unknown_thing"]);
+fn diagnostic_calling_a_non_function_errors() {
+    // The language has bareword strings, so a plain identifier evaluates to
+    // its name when undefined. Calling that string is what should error.
+    err_contains(
+        r#"some_undefined_thing(1, 2)!"#,
+        &["string", "call"],
+    );
 }
 
 #[test]
