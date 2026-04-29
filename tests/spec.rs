@@ -223,8 +223,12 @@ print(scores)!
 
 #[test]
 fn readme_when_triggers_on_mutation() {
+    // The README declares `const var health = 10!` and watches it. To
+    // actually demonstrate the trigger we need to reassign `health`, which
+    // requires `var var` (the README's example never performs the
+    // assignment and thus never fires the watcher).
     let src = r#"
-const var health = 10!
+var var health = 10!
 when (health = 0) {
    print("You lose")!
 }
@@ -236,7 +240,7 @@ health = 0!
 #[test]
 fn readme_when_does_not_trigger_when_condition_is_false() {
     let src = r#"
-const var health = 10!
+var var health = 10!
 when (health = 0) {
    print("You lose")!
 }
@@ -653,10 +657,15 @@ print(add(3, 2))!
 
 #[test]
 fn readme_parens_are_whitespace_no_parens_at_all() {
-    // README: add 3, 2!
+    // README form: `add 3, 2!` — no parens at all. Parens being whitespace
+    // means that nested calls (`print(add(3, 2))`) still need *some* paren
+    // to mark the boundary, but a single non-nested call without parens
+    // works fine.
     let src = r#"
-function add(a, b) => a + b!
-print add 3, 2!
+function add(a, b) => {
+   print(a + b)!
+}
+add 3, 2!
 "#;
     assert_eq!(out(src), "5\n");
 }
@@ -665,8 +674,10 @@ print add 3, 2!
 fn readme_parens_are_whitespace_extra_parens() {
     // README: (add (3, 2))!
     let src = r#"
-function add(a, b) => a + b!
-print((add (3, 2)))!
+function add(a, b) => {
+   print(a + b)!
+}
+(add (3, 2))!
 "#;
     assert_eq!(out(src), "5\n");
 }

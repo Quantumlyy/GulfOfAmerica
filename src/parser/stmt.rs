@@ -183,6 +183,11 @@ impl<'a> Parser<'a> {
 
     fn parse_expr_or_assign(&mut self, start: Span) -> Result<Stmt, Diagnostic> {
         let lhs = self.parse_expr_no_assign()?;
+        // No-paren call at statement top level: when the LHS is callable
+        // (an identifier or a member access on one) and the next token can
+        // begin an expression (not an operator, not a terminator), the rest
+        // of the statement is a comma-separated argument list.
+        let lhs = self.maybe_no_paren_call(lhs)?;
         if matches!(self.peek().kind, TokenKind::Eq(1)) {
             self.bump();
             let value = self.parse_expr()?;
@@ -231,6 +236,48 @@ impl<'a> Parser<'a> {
                 bangs: term.bangs,
                 questions: term.questions,
                 span,
+            })
+        }
+    }
+
+    fn maybe_no_paren_call(&mut self, lhs: Expr) -> Result<Expr, Diagnostic> {
+        // Only callable shapes: identifier or member access.
+        let callable = matches!(lhs, Expr::Ident { .. } | Expr::Member { .. });
+        if !callable {
+            return Ok(lhs);
+        }
+        if !starts_no_paren_arg(&self.peek().kind) {
+            return Ok(lhs);
+        }
+        // Collect comma-separated args until terminator.
+        let mut args = Vec::new();
+        args.push(self.parse_expr()?);
+        while matches!(self.peek().kind, TokenKind::Comma) {
+            self.bump();
+            args.push(self.parse_expr()?);
+        }
+        let span = lhs.span().merge(args.last().unwrap().span());
+        Ok(Expr::Call {
+            callee: Box::new(lhs),
+            args,
+            span,
+        })
+    }
+
+    /// Parse a terminator if `required` or if one is actually present.
+    pub(crate) fn maybe_terminator(&mut self, required: bool) -> Result<Terminator, Diagnostic> {
+        let has_one = matches!(
+            self.peek().kind,
+            TokenKind::Bang(_) | TokenKind::Question(_) | TokenKind::InvertedBang(_)
+        );
+        if required || has_one {
+            self.parse_terminator()
+        } else {
+            Ok(Terminator {
+                bangs: Some(1),
+                questions: None,
+                inverted_bangs: 0,
+                span: self.peek().span,
             })
         }
     }
@@ -615,9 +662,26 @@ impl<'a> Parser<'a> {
         }
         self.expect(|k| matches!(k, TokenKind::FatArrow), "`=>`")?;
         let body = self.parse_fn_body()?;
-        // Body may have its own terminator if it was an `expr-bodied` function.
-        // In that case parse_fn_body already left us pointing at `!`.
-        let term = self.parse_terminator()?;
+        // Block bodies are self-terminating (the closing `}` ends the
+        // statement). Expression bodies still require `!`/`?`. We accept an
+        // optional trailing terminator either way for overload-priority
+        // purposes.
+        let needs_term = matches!(body, crate::ast::FnBody::Expr(_));
+        let term = if needs_term {
+            self.parse_terminator()?
+        } else if matches!(
+            self.peek().kind,
+            TokenKind::Bang(_) | TokenKind::Question(_) | TokenKind::InvertedBang(_)
+        ) {
+            self.parse_terminator()?
+        } else {
+            Terminator {
+                bangs: Some(1),
+                questions: None,
+                inverted_bangs: 0,
+                span: start,
+            }
+        };
         let span = start.merge(term.span);
         Ok(Stmt::FnDecl {
             is_async,
@@ -674,7 +738,7 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(|k| matches!(k, TokenKind::FatArrow), "`=>`")?;
                 let body = self.parse_fn_body()?;
-                let term = self.parse_terminator()?;
+                let term = self.maybe_terminator(matches!(body, crate::ast::FnBody::Expr(_)))?;
                 let span = start.merge(term.span);
                 Ok(crate::ast::ClassMember::Method {
                     is_async: false,
@@ -705,7 +769,7 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(|k| matches!(k, TokenKind::FatArrow), "`=>`")?;
                 let body = self.parse_fn_body()?;
-                let term = self.parse_terminator()?;
+                let term = self.maybe_terminator(matches!(body, crate::ast::FnBody::Expr(_)))?;
                 let span = start.merge(term.span);
                 Ok(crate::ast::ClassMember::Method {
                     is_async: true,
@@ -775,6 +839,31 @@ impl Stmt {
             | Stmt::Reverse { span } => *span,
         }
     }
+}
+
+/// True for tokens that can begin a primary expression — used to recognise
+/// the "no-paren call" form `f a, b, c!` at statement top level.
+fn starts_no_paren_arg(k: &TokenKind) -> bool {
+    matches!(
+        k,
+        TokenKind::Number(_)
+            | TokenKind::String(_)
+            | TokenKind::Ident(_)
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Maybe
+            | TokenKind::Null
+            | TokenKind::Undefined
+            | TokenKind::LBracket
+            | TokenKind::LBrace
+            | TokenKind::Minus
+            | TokenKind::Semi
+            | TokenKind::New
+            | TokenKind::Use
+            | TokenKind::Previous
+            | TokenKind::Next
+            | TokenKind::Current
+    )
 }
 
 // Suppress unused-warnings for items used by later commits.

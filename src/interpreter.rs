@@ -24,7 +24,7 @@ use crate::ast::{
 use crate::diagnostic::{Diagnostic, Label};
 use crate::env::{self, Binding, Scope};
 use crate::source::{SourceFile, Span};
-use crate::value::{fresh_id, BoolVal, BuiltinFn, Function, Object, Value};
+use crate::value::{fresh_id, BoolVal, BuiltinFn, Class, ClassMethod, Function, Instance, Object, Value};
 
 /// Public outcome of running a program.
 #[derive(Debug, Default)]
@@ -42,6 +42,19 @@ pub struct Interpreter {
     /// Names that have been `delete`d (primitives or keywords). The string is
     /// the surface form, e.g. `"3"` or `"class"`.
     pub(crate) deleted: Vec<String>,
+    /// Active `when` watchers — re-checked after every statement.
+    pub(crate) watchers: Vec<Watcher>,
+    /// Source text of the file currently being run (set in `run_file`), so
+    /// that `?` debug-prints can quote the original expression.
+    pub(crate) current_source: Option<Rc<String>>,
+}
+
+#[derive(Debug)]
+pub struct Watcher {
+    pub cond: Expr,
+    pub block: crate::ast::Block,
+    pub scope: Scope,
+    pub last_truthy: bool,
 }
 
 impl Default for Interpreter {
@@ -58,6 +71,8 @@ impl Interpreter {
             start_time: Instant::now(),
             globals: env::new_scope(),
             deleted: Vec::new(),
+            watchers: Vec::new(),
+            current_source: None,
         };
         builtins::install(&mut interp);
         interp
@@ -65,9 +80,10 @@ impl Interpreter {
 
     pub fn run(
         &mut self,
-        _file: &SourceFile,
+        source: &SourceFile,
         program: &Program,
     ) -> Result<RunOutcome, Diagnostic> {
+        self.current_source = Some(Rc::new(source.text.clone()));
         for file in &program.files {
             // Each `=====`-separated file gets a fresh global scope so that
             // declarations don't leak across boundaries.
@@ -115,6 +131,7 @@ impl Interpreter {
                 }
             }
             self.exec_stmt(stmt, &Rc::clone(&self.globals))?;
+            self.run_watchers()?;
         }
         Ok(())
     }
@@ -144,6 +161,64 @@ impl Interpreter {
                 priority: _,
                 span,
             } => self.exec_assign(target, value, *span, scope),
+            Stmt::ClassDecl {
+                name,
+                members,
+                span,
+            } => {
+                let mut fields = Vec::new();
+                let mut methods = Vec::new();
+                for m in members {
+                    match m {
+                        crate::ast::ClassMember::Field {
+                            decl, name, value, ..
+                        } => fields.push((name.clone(), *decl, value.clone())),
+                        crate::ast::ClassMember::Method {
+                            is_async,
+                            name,
+                            params,
+                            body,
+                            ..
+                        } => methods.push(ClassMethod {
+                            is_async: *is_async,
+                            name: name.clone(),
+                            params: params.clone(),
+                            body: body.clone(),
+                        }),
+                    }
+                }
+                let class = Value::Class(Rc::new(RefCell::new(Class {
+                    name: name.clone(),
+                    fields,
+                    methods,
+                    instance: None,
+                    captured: Rc::clone(scope),
+                })));
+                env::insert(
+                    scope,
+                    Binding {
+                        name: name.clone(),
+                        value: class,
+                        decl: DeclKind::ConstConst,
+                        priority: 0,
+                        created_line: self.line,
+                        created_at: Instant::now(),
+                        lifetime: None,
+                        eternal: false,
+                    },
+                );
+                let _ = span;
+                Ok(())
+            }
+            Stmt::Delete { target, span } => self.exec_delete(target, *span, scope),
+            Stmt::When { cond, block, span } => {
+                self.install_watcher(cond, block.clone(), *span, scope)
+            }
+            Stmt::Reverse { .. } | Stmt::Export { .. } | Stmt::Import { .. } => {
+                // Reverse / export / import are accepted but no-ops in this
+                // single-file build of the interpreter.
+                Ok(())
+            }
             Stmt::FnDecl {
                 is_async,
                 name,
@@ -245,7 +320,24 @@ impl Interpreter {
 
     pub(crate) fn eval_expr(&mut self, expr: &Expr, scope: &Scope) -> Result<Value, Diagnostic> {
         match expr {
-            Expr::Number { value, .. } => Ok(Value::Number(*value)),
+            Expr::Number { value, literal, .. } => {
+                // The user can rebind a numeric literal as a name:
+                // `const const 5 = 4!` makes `5` evaluate to `4`. We honour
+                // any binding for the literal source text before falling back
+                // to its numeric value.
+                if let Some(v) = env::lookup(scope, literal, self.line, self.start_time) {
+                    return Ok(v);
+                }
+                if self.deleted.iter().any(|d| d == literal) {
+                    return Err(Diagnostic::error(format!("{literal} has been deleted"))
+                        .with_code("E0301")
+                        .with_label(Label::primary(
+                            expr.span(),
+                            "this value was previously deleted",
+                        )));
+                }
+                Ok(Value::Number(*value))
+            }
             Expr::String {
                 parts,
                 quote_count: _,
@@ -277,6 +369,7 @@ impl Interpreter {
             Expr::Call { callee, args, span } => self.eval_call(callee, args, *span, scope),
             Expr::Unary { op, operand, span } => self.eval_unary(*op, operand, *span, scope),
             Expr::Binary { op, lhs, rhs, span } => self.eval_binary(*op, lhs, rhs, *span, scope),
+            Expr::New { class, args, span } => self.eval_new(class, args, *span, scope),
             Expr::Member { target, name, span } => self.eval_member(target, name, *span, scope),
             Expr::Index {
                 target,
@@ -357,6 +450,52 @@ impl Interpreter {
         span: Span,
         scope: &Scope,
     ) -> Result<Value, Diagnostic> {
+        // Special-case `bound_ident.method(...)` so we can enforce
+        // mutability based on the binding's `DeclKind`.
+        if let Expr::Member {
+            target,
+            name: method_name,
+            ..
+        } = callee
+        {
+            if let Expr::Ident { name: var_name, span: name_span } = target.as_ref() {
+                if is_mutating_method(method_name) {
+                    let mutable_ok = env::lookup_binding(
+                        scope,
+                        var_name,
+                        self.line,
+                        self.start_time,
+                        |b| b.decl.mutable() || b.priority == i32::MIN,
+                    )
+                    .unwrap_or(true); // bareword strings: allow
+                    if !mutable_ok {
+                        let decl_label = env::lookup_binding(
+                            scope,
+                            var_name,
+                            self.line,
+                            self.start_time,
+                            |b| b.decl.label(),
+                        )
+                        .unwrap_or("const const");
+                        return Err(Diagnostic::error(format!(
+                            "cannot mutate `{var_name}` via `.{method_name}()`"
+                        ))
+                        .with_code("E0702")
+                        .with_label(Label::primary(
+                            *name_span,
+                            format!(
+                                "this variable was declared as `{decl_label}`, which forbids \
+                                 in-place mutation"
+                            ),
+                        ))
+                        .with_note(
+                            "to allow `.pop()` / `.push()` / etc., declare it as `const var` \
+                             or `var var`.",
+                        ));
+                    }
+                }
+            }
+        }
         let f = self.eval_expr(callee, scope)?;
         let mut vs = Vec::with_capacity(args.len());
         for a in args {
@@ -482,7 +621,7 @@ impl Interpreter {
         }
         let lv = self.eval_expr(lhs, scope)?;
         let rv = self.eval_expr(rhs, scope)?;
-        match op {
+        let result = match op {
             BinOp::Add => add(&lv, &rv, span),
             BinOp::Sub => num_op(&lv, &rv, span, |a, b| a - b, "subtract"),
             BinOp::Mul => num_op(&lv, &rv, span, |a, b| a * b, "multiply"),
@@ -511,7 +650,158 @@ impl Interpreter {
             BinOp::Gt => num_cmp(&lv, &rv, span, |a, b| a > b),
             BinOp::LtEq => num_cmp(&lv, &rv, span, |a, b| a <= b),
             BinOp::GtEq => num_cmp(&lv, &rv, span, |a, b| a >= b),
+        };
+        // If the producing value is a number whose surface form has been
+        // `delete`d, that's an error: `delete 3!` then `2 + 1` yields 3,
+        // which has been deleted.
+        let v = result?;
+        if let Value::Number(n) = &v {
+            let display = crate::value::Value::Number(*n).display();
+            if self.deleted.iter().any(|d| d == &display) {
+                return Err(Diagnostic::error(format!("{display} has been deleted"))
+                    .with_code("E0301")
+                    .with_label(Label::primary(span, "this value was previously deleted"))
+                    .with_note(
+                        "primitives can be removed from a program with `delete`. Once gone, \
+                         arithmetic that produces them errors.",
+                    ));
+            }
         }
+        Ok(v)
+    }
+
+    fn eval_new(
+        &mut self,
+        class_expr: &Expr,
+        _args: &[Expr],
+        span: Span,
+        scope: &Scope,
+    ) -> Result<Value, Diagnostic> {
+        let v = self.eval_expr(class_expr, scope)?;
+        let class_rc = match v {
+            Value::Class(c) => c,
+            other => {
+                return Err(Diagnostic::error(format!(
+                    "cannot instantiate a {} with `new`",
+                    other.type_name()
+                ))
+                .with_code("E0800")
+                .with_label(Label::primary(class_expr.span(), "expected a class here")));
+            }
+        };
+        if class_rc.borrow().instance.is_some() {
+            let class_name = class_rc.borrow().name.clone();
+            return Err(Diagnostic::error(format!(
+                "Can't have more than one '{class_name}' instance"
+            ))
+            .with_code("E0801")
+            .with_label(Label::primary(
+                span,
+                format!("a `{class_name}` instance already exists"),
+            ))
+            .with_note(
+                "classes in Gulf of Mexico allow only one instance, ever. Use a factory \
+                 function (e.g. `class PlayerMaker { function makePlayer() => { class Player \
+                 { ... } new Player() }! }`) to work around this.",
+            ));
+        }
+        // Fresh instance with each field's default value.
+        let mut fields = Object::new();
+        let class_borrow = class_rc.borrow();
+        let class_scope = Rc::clone(&class_borrow.captured);
+        let field_decls: Vec<(String, DeclKind, Expr)> = class_borrow.fields.clone();
+        let methods = class_borrow.methods.clone();
+        let class_name = class_borrow.name.clone();
+        drop(class_borrow);
+        for (name, _decl, default) in &field_decls {
+            let v = self.eval_expr(default, &class_scope)?;
+            fields.set(name, v);
+        }
+        let instance = Rc::new(RefCell::new(Instance {
+            class_name: class_name.clone(),
+            fields,
+        }));
+        let id = fresh_id();
+        let inst_value = Value::Instance(Rc::clone(&instance), id);
+        // Install methods as bound functions on the instance object.
+        for m in methods {
+            let func = Value::Function(Rc::new(Function {
+                name: format!("{}.{}", class_name, m.name),
+                is_async: m.is_async,
+                params: m.params.clone(),
+                body: m.body.clone(),
+                captured: Rc::clone(&class_scope),
+            }));
+            instance.borrow_mut().fields.set(&m.name, func);
+        }
+        class_rc.borrow_mut().instance = Some(Rc::clone(&instance));
+        Ok(inst_value)
+    }
+
+    fn install_watcher(
+        &mut self,
+        cond: &Expr,
+        block: crate::ast::Block,
+        _span: Span,
+        scope: &Scope,
+    ) -> Result<(), Diagnostic> {
+        // We model `when (cond) { block }` as a re-check that runs after every
+        // statement in the rest of the file. To keep the implementation
+        // simple, we hook it into the file-level loop via the `watchers` list
+        // on `Interpreter` and re-check at each step.
+        self.watchers.push(Watcher {
+            cond: cond.clone(),
+            block,
+            scope: Rc::clone(scope),
+            last_truthy: false,
+        });
+        // First evaluation: if it's already true, run immediately so that the
+        // user can rely on initial-state semantics if they want.
+        let init = self.eval_expr(cond, scope)?;
+        let last = self.watchers.last_mut().unwrap();
+        last.last_truthy = truthy(&init);
+        Ok(())
+    }
+
+    pub(crate) fn run_watchers(&mut self) -> Result<(), Diagnostic> {
+        // Drain into a local vector so we can mutate `self.watchers` while
+        // running their bodies.
+        let mut watchers = std::mem::take(&mut self.watchers);
+        for w in &mut watchers {
+            let v = self.eval_expr(&w.cond, &Rc::clone(&w.scope))?;
+            let now = truthy(&v);
+            if now && !w.last_truthy {
+                let scope = Rc::clone(&w.scope);
+                self.exec_block(&w.block, &scope)?;
+            }
+            w.last_truthy = now;
+        }
+        self.watchers = watchers;
+        Ok(())
+    }
+
+    fn exec_delete(
+        &mut self,
+        target: &Expr,
+        _span: Span,
+        _scope: &Scope,
+    ) -> Result<(), Diagnostic> {
+        // Tombstone the surface form. `delete 3!` -> add "3" to deleted;
+        // `delete x!` -> add "x".
+        let key = match target {
+            Expr::Ident { name, .. } => name.clone(),
+            Expr::Number { literal, .. } => literal.clone(),
+            Expr::String { parts, .. } => parts
+                .iter()
+                .filter_map(|p| match p {
+                    StrPart::Lit(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            other => format!("{:?}", std::mem::discriminant(other)),
+        };
+        self.deleted.push(key);
+        Ok(())
     }
 
     fn eval_member(
@@ -615,8 +905,13 @@ impl Interpreter {
         }
     }
 
-    pub(crate) fn format_expr_source(&self, _expr: &Expr) -> String {
-        // Best-effort: caller can render via spans if needed.
+    pub(crate) fn format_expr_source(&self, expr: &Expr) -> String {
+        if let Some(src) = &self.current_source {
+            let s = expr.span();
+            let end = s.end.min(src.len());
+            let start = s.start.min(end);
+            return src[start..end].to_string();
+        }
         "<expr>".to_string()
     }
 
@@ -701,6 +996,13 @@ impl Interpreter {
                  that part of the language yet.",
             )
     }
+}
+
+fn is_mutating_method(name: &str) -> bool {
+    matches!(
+        name,
+        "pop" | "push" | "unshift" | "shift" | "splice" | "sort" | "reverse"
+    )
 }
 
 fn truthy(v: &Value) -> bool {

@@ -126,7 +126,7 @@ pub struct Class {
     pub captured: crate::env::Scope,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClassMethod {
     pub is_async: bool,
     pub name: String,
