@@ -54,10 +54,12 @@ impl<'a> Parser<'a> {
         matches!(self.peek().kind, TokenKind::Eof)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn at(&self, kind_match: impl Fn(&TokenKind) -> bool) -> bool {
         kind_match(&self.peek().kind)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn eat(&mut self, kind_match: impl Fn(&TokenKind) -> bool) -> Option<Token> {
         if kind_match(&self.peek().kind) {
             Some(self.bump())
@@ -82,6 +84,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn span_to_here(&self, start: Span) -> Span {
         let here = if self.pos == 0 {
             self.peek().span
@@ -240,6 +243,92 @@ mod tests {
                 crate::ast::BindingTarget::Ident { name, .. } => assert_eq!(name, "5"),
                 _ => panic!(),
             },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_if_else() {
+        let p = parse_str(r#"if (x = 1) { print(1)! } else { print(2)! }"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::If {
+                else_block: Some(_),
+                ..
+            } => {}
+            other => panic!("expected if/else, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_when_block() {
+        let p = parse_str(r#"when (h = 0) { print("dead")! }"#).unwrap();
+        assert!(matches!(p.files[0].stmts[0], crate::ast::Stmt::When { .. }));
+    }
+
+    #[test]
+    fn parses_fn_decl_with_expr_body() {
+        let p = parse_str(r#"function add(a, b) => a + b!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::FnDecl { name, params, .. } => {
+                assert_eq!(name, "add");
+                assert_eq!(params.len(), 2);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_fn_decl_with_block_body() {
+        let p = parse_str(
+            r#"function greet() => {
+   print("hi")!
+}!"#,
+        )
+        .unwrap();
+        assert!(matches!(p.files[0].stmts[0], crate::ast::Stmt::FnDecl { .. }));
+    }
+
+    #[test]
+    fn parses_class_decl_with_field_and_method() {
+        let p = parse_str(
+            r#"class Player {
+   const var health = 10!
+   function heal() => {
+      health = 11!
+   }!
+}"#,
+        )
+        .unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::ClassDecl { members, .. } => assert_eq!(members.len(), 2),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_return_with_value() {
+        let p = parse_str(r#"function five() => { return 5! }!"#).unwrap();
+        assert!(matches!(p.files[0].stmts[0], crate::ast::Stmt::FnDecl { .. }));
+    }
+
+    #[test]
+    fn parses_delete() {
+        let p = parse_str(r#"delete 3!"#).unwrap();
+        assert!(matches!(p.files[0].stmts[0], crate::ast::Stmt::Delete { .. }));
+    }
+
+    #[test]
+    fn parses_export_to() {
+        let p = parse_str(r#"export add to "main.gom"!"#).unwrap();
+        match &p.files[0].stmts[0] {
+            crate::ast::Stmt::Export {
+                name,
+                target_file,
+                ..
+            } => {
+                assert_eq!(name, "add");
+                assert_eq!(target_file, "main.gom");
+            }
             _ => panic!(),
         }
     }

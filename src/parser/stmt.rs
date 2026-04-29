@@ -452,39 +452,328 @@ impl<'a> Parser<'a> {
         self.expect(|k| matches!(k, TokenKind::RAngle), "`>`")?;
         Ok(lt)
     }
-    fn parse_if(&mut self, _start: Span) -> Result<Stmt, Diagnostic> {
-        Err(self.todo("`if` parsing"))
-    }
-    fn parse_when(&mut self, _start: Span) -> Result<Stmt, Diagnostic> {
-        Err(self.todo("`when` parsing"))
-    }
-    fn parse_class_decl(&mut self, _start: Span) -> Result<Stmt, Diagnostic> {
-        Err(self.todo("class parsing"))
-    }
-    fn parse_fn_decl(
-        &mut self,
-        _start: Span,
-        _is_async: bool,
-    ) -> Result<Stmt, Diagnostic> {
-        Err(self.todo("function declaration parsing"))
-    }
-    fn parse_return(&mut self, _start: Span) -> Result<Stmt, Diagnostic> {
-        Err(self.todo("`return` parsing"))
-    }
-    fn parse_delete(&mut self, _start: Span) -> Result<Stmt, Diagnostic> {
-        Err(self.todo("`delete` parsing"))
-    }
-    fn parse_export(&mut self, _start: Span) -> Result<Stmt, Diagnostic> {
-        Err(self.todo("`export` parsing"))
-    }
-    fn parse_import(&mut self, _start: Span) -> Result<Stmt, Diagnostic> {
-        Err(self.todo("`import` parsing"))
+    fn parse_if(&mut self, start: Span) -> Result<Stmt, Diagnostic> {
+        self.bump(); // `if`
+        // The condition's parens are optional; we accept either form. Inside
+        // the parens, `=` is comparison (not assignment) — and that is what
+        // the parens-aware expression parser already does.
+        let had_paren = matches!(self.peek().kind, TokenKind::LParen);
+        if had_paren {
+            self.bump();
+        }
+        let cond = self.parse_expr()?;
+        if had_paren {
+            self.expect(|k| matches!(k, TokenKind::RParen), "`)`")?;
+        }
+        let then_block = self.parse_block()?;
+        let else_block = if matches!(self.peek().kind, TokenKind::Else) {
+            self.bump();
+            if matches!(self.peek().kind, TokenKind::If) {
+                // `else if` — wrap as a single-statement else block.
+                let nested_start = self.peek().span;
+                let nested = self.parse_if(nested_start)?;
+                let span = nested.span_helper();
+                Some(Block {
+                    stmts: vec![nested],
+                    span,
+                })
+            } else {
+                Some(self.parse_block()?)
+            }
+        } else {
+            None
+        };
+        let span = start.merge(
+            else_block
+                .as_ref()
+                .map(|b| b.span)
+                .unwrap_or(then_block.span),
+        );
+        Ok(Stmt::If {
+            cond,
+            then_block,
+            else_block,
+            span,
+        })
     }
 
-    fn todo(&self, what: &str) -> Diagnostic {
-        Diagnostic::error(format!("{what} not yet implemented")).with_label(
-            Label::primary(self.peek().span, "interpreter is still under construction"),
-        )
+    fn parse_when(&mut self, start: Span) -> Result<Stmt, Diagnostic> {
+        self.bump(); // `when`
+        let had_paren = matches!(self.peek().kind, TokenKind::LParen);
+        if had_paren {
+            self.bump();
+        }
+        let cond = self.parse_expr()?;
+        if had_paren {
+            self.expect(|k| matches!(k, TokenKind::RParen), "`)`")?;
+        }
+        let block = self.parse_block()?;
+        Ok(Stmt::When {
+            cond,
+            block: block.clone(),
+            span: start.merge(block.span),
+        })
+    }
+
+    fn parse_return(&mut self, start: Span) -> Result<Stmt, Diagnostic> {
+        self.bump(); // `return`
+        // A bare `return!` returns undefined.
+        let value = if matches!(
+            self.peek().kind,
+            TokenKind::Bang(_) | TokenKind::Question(_) | TokenKind::InvertedBang(_)
+        ) {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        let term = self.parse_terminator()?;
+        Ok(Stmt::Return {
+            value,
+            span: start.merge(term.span),
+        })
+    }
+
+    fn parse_delete(&mut self, start: Span) -> Result<Stmt, Diagnostic> {
+        self.bump(); // `delete`
+        let target = self.parse_expr()?;
+        let term = self.parse_terminator()?;
+        Ok(Stmt::Delete {
+            target,
+            span: start.merge(term.span),
+        })
+    }
+
+    fn parse_export(&mut self, start: Span) -> Result<Stmt, Diagnostic> {
+        self.bump(); // `export`
+        let name_tok = self.expect(
+            |k| matches!(k, TokenKind::Ident(_)),
+            "name to export",
+        )?;
+        let TokenKind::Ident(name) = name_tok.kind else {
+            unreachable!()
+        };
+        self.expect(|k| matches!(k, TokenKind::To), "`to`")?;
+        let path_tok = self.bump();
+        let target_file = match path_tok.kind {
+            TokenKind::String(parts) => parts
+                .into_iter()
+                .filter_map(|p| match p {
+                    crate::token::StringPart::Lit(s) => Some(s),
+                    _ => None,
+                })
+                .collect::<String>(),
+            ref other => {
+                return Err(Diagnostic::error(format!(
+                    "expected a string filename after `to`, found {}",
+                    other.describe()
+                ))
+                .with_code("E0130")
+                .with_label(Label::primary(path_tok.span, "expected a filename here")));
+            }
+        };
+        let term = self.parse_terminator()?;
+        Ok(Stmt::Export {
+            name,
+            target_file,
+            span: start.merge(term.span),
+        })
+    }
+
+    fn parse_import(&mut self, start: Span) -> Result<Stmt, Diagnostic> {
+        self.bump(); // `import`
+        let name_tok = self.expect(
+            |k| matches!(k, TokenKind::Ident(_)),
+            "name to import",
+        )?;
+        let TokenKind::Ident(name) = name_tok.kind else {
+            unreachable!()
+        };
+        let term = self.parse_terminator()?;
+        Ok(Stmt::Import {
+            name,
+            span: start.merge(term.span),
+        })
+    }
+
+    fn parse_fn_decl(&mut self, start: Span, is_async: bool) -> Result<Stmt, Diagnostic> {
+        self.bump(); // function-keyword
+        let name_tok = self.expect(
+            |k| matches!(k, TokenKind::Ident(_)),
+            "function name",
+        )?;
+        let TokenKind::Ident(name) = name_tok.kind else {
+            unreachable!()
+        };
+        // Parens around params are optional (parens are whitespace).
+        let had_paren = matches!(self.peek().kind, TokenKind::LParen);
+        if had_paren {
+            self.bump();
+        }
+        let params = self.parse_param_list()?;
+        if had_paren {
+            self.expect(|k| matches!(k, TokenKind::RParen), "`)`")?;
+        }
+        self.expect(|k| matches!(k, TokenKind::FatArrow), "`=>`")?;
+        let body = self.parse_fn_body()?;
+        // Body may have its own terminator if it was an `expr-bodied` function.
+        // In that case parse_fn_body already left us pointing at `!`.
+        let term = self.parse_terminator()?;
+        let span = start.merge(term.span);
+        Ok(Stmt::FnDecl {
+            is_async,
+            name,
+            params,
+            body,
+            priority: term.priority(),
+            span,
+        })
+    }
+
+    fn parse_class_decl(&mut self, start: Span) -> Result<Stmt, Diagnostic> {
+        self.bump(); // `class` or `className`
+        let name_tok = self.expect(
+            |k| matches!(k, TokenKind::Ident(_)),
+            "class name",
+        )?;
+        let TokenKind::Ident(name) = name_tok.kind else {
+            unreachable!()
+        };
+        let body_open = self.expect(|k| matches!(k, TokenKind::LBrace), "`{`")?;
+        let mut members = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            members.push(self.parse_class_member()?);
+        }
+        let body_close = self.expect(|k| matches!(k, TokenKind::RBrace), "`}`")?;
+        Ok(Stmt::ClassDecl {
+            name,
+            members,
+            span: start.merge(body_open.span.merge(body_close.span)),
+        })
+    }
+
+    fn parse_class_member(&mut self) -> Result<crate::ast::ClassMember, Diagnostic> {
+        match self.peek().kind {
+            // `function method(...) => body!` (any "function" prefix).
+            TokenKind::FnKeyword => {
+                let start = self.peek().span;
+                self.bump();
+                let name_tok = self.expect(
+                    |k| matches!(k, TokenKind::Ident(_)),
+                    "method name",
+                )?;
+                let TokenKind::Ident(name) = name_tok.kind else {
+                    unreachable!()
+                };
+                let had_paren = matches!(self.peek().kind, TokenKind::LParen);
+                if had_paren {
+                    self.bump();
+                }
+                let params = self.parse_param_list()?;
+                if had_paren {
+                    self.expect(|k| matches!(k, TokenKind::RParen), "`)`")?;
+                }
+                self.expect(|k| matches!(k, TokenKind::FatArrow), "`=>`")?;
+                let body = self.parse_fn_body()?;
+                let term = self.parse_terminator()?;
+                let span = start.merge(term.span);
+                Ok(crate::ast::ClassMember::Method {
+                    is_async: false,
+                    name,
+                    params,
+                    body,
+                    span,
+                })
+            }
+            TokenKind::Async => {
+                let start = self.peek().span;
+                self.bump();
+                self.expect(|k| matches!(k, TokenKind::FnKeyword), "function keyword")?;
+                let name_tok = self.expect(
+                    |k| matches!(k, TokenKind::Ident(_)),
+                    "method name",
+                )?;
+                let TokenKind::Ident(name) = name_tok.kind else {
+                    unreachable!()
+                };
+                let had_paren = matches!(self.peek().kind, TokenKind::LParen);
+                if had_paren {
+                    self.bump();
+                }
+                let params = self.parse_param_list()?;
+                if had_paren {
+                    self.expect(|k| matches!(k, TokenKind::RParen), "`)`")?;
+                }
+                self.expect(|k| matches!(k, TokenKind::FatArrow), "`=>`")?;
+                let body = self.parse_fn_body()?;
+                let term = self.parse_terminator()?;
+                let span = start.merge(term.span);
+                Ok(crate::ast::ClassMember::Method {
+                    is_async: true,
+                    name,
+                    params,
+                    body,
+                    span,
+                })
+            }
+            // `const var name = value!` field declaration.
+            TokenKind::Const | TokenKind::Var => {
+                let start = self.peek().span;
+                let stmt = self.parse_let(start)?;
+                match stmt {
+                    Stmt::Let {
+                        decl,
+                        target,
+                        value,
+                        span,
+                        ..
+                    } => match target {
+                        BindingTarget::Ident { name, .. } => {
+                            Ok(crate::ast::ClassMember::Field {
+                                decl,
+                                name,
+                                value,
+                                span,
+                            })
+                        }
+                        _ => Err(Diagnostic::error(
+                            "destructuring patterns are not allowed for class fields",
+                        )
+                        .with_code("E0140")
+                        .with_label(Label::primary(span, "destructure not allowed here"))),
+                    },
+                    _ => unreachable!(),
+                }
+            }
+            ref other => {
+                let span = self.peek().span;
+                Err(Diagnostic::error(format!(
+                    "expected a class member (field or method), found {}",
+                    other.describe()
+                ))
+                .with_code("E0141")
+                .with_label(Label::primary(span, "expected a member here")))
+            }
+        }
+    }
+}
+
+/// Trait helper: every `Stmt` knows its own span.
+impl Stmt {
+    fn span_helper(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. }
+            | Stmt::Expr { span, .. }
+            | Stmt::Assign { span, .. }
+            | Stmt::If { span, .. }
+            | Stmt::When { span, .. }
+            | Stmt::FnDecl { span, .. }
+            | Stmt::ClassDecl { span, .. }
+            | Stmt::Return { span, .. }
+            | Stmt::Delete { span, .. }
+            | Stmt::Export { span, .. }
+            | Stmt::Import { span, .. }
+            | Stmt::Reverse { span } => *span,
+        }
     }
 }
 
