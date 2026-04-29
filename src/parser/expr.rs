@@ -22,23 +22,29 @@ use super::Parser;
 
 /// Lowest binding power: don't terminate at any operator.
 pub(crate) const BP_NONE: u32 = 0;
-/// Binding power above the assignment-`=` cutoff. Used at statement level
-/// when we don't want to consume a top-level `=` (which means assignment).
-pub(crate) const BP_ABOVE_ASSIGN: u32 = 5;
 
 impl<'a> Parser<'a> {
     /// Parse a full expression including all operators.
     pub(crate) fn parse_expr(&mut self) -> Result<Expr, Diagnostic> {
-        self.parse_expr_bp(BP_NONE)
+        self.parse_expr_inner(BP_NONE, true)
     }
 
     /// Parse an expression but stop before consuming a top-level `=` (so the
-    /// caller can treat it as an assignment statement).
+    /// caller can treat it as an assignment statement). Nested expressions
+    /// inside parens, brackets, etc. always allow `=`.
     pub(crate) fn parse_expr_no_assign(&mut self) -> Result<Expr, Diagnostic> {
-        self.parse_expr_bp(BP_ABOVE_ASSIGN)
+        self.parse_expr_inner(BP_NONE, false)
     }
 
     pub(crate) fn parse_expr_bp(&mut self, min_bp: u32) -> Result<Expr, Diagnostic> {
+        self.parse_expr_inner(min_bp, true)
+    }
+
+    fn parse_expr_inner(
+        &mut self,
+        min_bp: u32,
+        allow_assign_eq: bool,
+    ) -> Result<Expr, Diagnostic> {
         let mut lhs = self.parse_prefix()?;
         loop {
             // Postfix: member access, indexing, calls.
@@ -50,12 +56,16 @@ impl<'a> Parser<'a> {
             let Some((op, bp_left, bp_right)) = self.peek_binop() else {
                 break;
             };
+            if !allow_assign_eq && matches!(op, BinOp::EqLoose1) {
+                break;
+            }
             if bp_left < min_bp {
                 break;
             }
             // Consume the operator.
             self.bump();
-            let rhs = self.parse_expr_bp(bp_right)?;
+            // Once we have descended into a sub-expression, `=` is fair game.
+            let rhs = self.parse_expr_inner(bp_right, true)?;
             let span = lhs.span().merge(rhs.span());
             lhs = Expr::Binary {
                 op,

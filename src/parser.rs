@@ -109,4 +109,42 @@ mod tests {
         assert_eq!(p.files.len(), 1);
         assert!(p.files[0].stmts.is_empty());
     }
+
+    #[test]
+    fn parses_simple_call_with_bang() {
+        let p = parse_str(r#"print("hi")!"#).unwrap();
+        assert_eq!(p.files[0].stmts.len(), 1);
+    }
+
+    #[test]
+    fn parses_question_mark_terminator() {
+        let p = parse_str(r#"print("hi")?"#).unwrap();
+        assert_eq!(p.files[0].stmts.len(), 1);
+    }
+
+    #[test]
+    fn parses_assignment_statement() {
+        let p = parse_str(r#"x = 5!"#).unwrap();
+        assert_eq!(p.files[0].stmts.len(), 1);
+        assert!(matches!(p.files[0].stmts[0], crate::ast::Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn rejects_missing_terminator() {
+        let err = parse_str("print 1\n").unwrap_err();
+        assert!(err.contains("expected `!`"));
+    }
+
+    #[test]
+    fn parses_file_separator() {
+        let src = r#"
+print("a")!
+=====================
+print("b")!
+"#;
+        let p = parse_str(src).unwrap();
+        assert_eq!(p.files.len(), 2);
+        assert_eq!(p.files[0].stmts.len(), 1);
+        assert_eq!(p.files[1].stmts.len(), 1);
+    }
 }
