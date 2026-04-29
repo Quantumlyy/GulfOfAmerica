@@ -47,7 +47,7 @@ error[E0700]: cannot reassign `name`
 ## Feature matrix
 
 Every example in the upstream README has a corresponding integration test in
-`tests/spec.rs`. **63 of 63 spec tests pass** in this implementation, plus
+`tests/spec.rs`. **78 of 78 spec tests pass** in this implementation, plus
 33 lexer/parser unit tests.
 
 | Spec section | Status | Notes |
@@ -75,11 +75,11 @@ Every example in the upstream README has a corresponding integration test in
 | `delete` (primitives, names) | ✅ | Tombstone is checked at literal evaluation *and* on arithmetic results. |
 | Overload priorities via `!`-count and `¡` | ✅ | Lookup picks the highest-priority live binding. |
 | Parentheses are whitespace | ✅ | `(add (3, 2))!`, `add 3, 2!` and `add)3, 2(!` all work. |
-| `previous` / `next` / `current` | ⚠️ Partial | Parsed; `current` returns the binding's current value. |
-| Async functions (line-interleaved execution) | ⚠️ Partial | Parsed; behaves synchronously. |
-| Signals (`use(0)`, destructured pairs) | ⚠️ Partial | Parsed; not yet wired through the runtime. |
-| `reverse!` | ⚠️ Partial | Accepted; no-op. |
-| `import` / `export to` | ⚠️ Partial | Parsed; no-op. |
+| `previous` / `next` / `current` | ✅ | `current` is now; `previous` is the value before the last reassignment; `next` peeks at the next assignment in the file. |
+| Async functions (line-interleaved execution) | ✅ | Un-`await`-ed calls queue a task that ticks one statement per main-thread statement; `await` runs synchronously and returns the result. |
+| Signals (`use(0)`, destructured pairs) | ✅ | `[get, set] = use(initial)` materialises a getter/setter pair sharing one cell. A non-destructured signal is itself callable: `sig()` reads, `sig(v)` writes. |
+| `reverse!` | ✅ | Reverses the remaining statements in the file. |
+| `import` / `export to` | ✅ | `export <name> to "file.gom"!` deposits a binding for `import <name>!` in the named `=====`-separated file. |
 | DBX (HTML-in-source) | ❌ | |
 | AI features (Lu Wilson auto-completion) | ❌ | We unfortunately do not have Lu's email. |
 
@@ -108,7 +108,7 @@ under `#![forbid(unsafe_code)]`.
 ## Tests
 
 ```sh
-cargo test            # 96 tests: 33 unit + 63 spec
+cargo test            # 111 tests: 33 unit + 78 spec
 cargo clippy --all-targets
 ```
 

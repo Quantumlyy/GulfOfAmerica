@@ -27,6 +27,10 @@ pub struct Binding {
     /// True for the third `const` in `const const const`. Such bindings
     /// cannot be deleted or shadowed even by higher-priority bindings.
     pub eternal: bool,
+    /// The value this binding held immediately before its most recent
+    /// reassignment, used by `previous x`. None if it has never been
+    /// reassigned since declaration.
+    pub previous_value: Option<Value>,
 }
 
 impl Binding {
@@ -144,6 +148,12 @@ pub fn lookup_binding<R>(
     None
 }
 
+/// Look up the previous value (the value held before the most recent
+/// reassignment) of the highest-priority live binding for `name`.
+pub fn lookup_previous(scope: &Scope, name: &str, now_line: usize, now_time: Instant) -> Option<Value> {
+    lookup_binding(scope, name, now_line, now_time, |b| b.previous_value.clone()).flatten()
+}
+
 /// True iff a binding with this name has *ever* been declared in this scope
 /// chain — used for lifetime-expiry diagnostics ("name has expired") and
 /// `delete`-tombstone errors. Includes expired bindings.
@@ -197,7 +207,8 @@ pub fn reassign(
         }
         if let Some(i) = best_idx {
             let decl = s_ref.bindings[i].decl;
-            s_ref.bindings[i].value = value;
+            let prev = std::mem::replace(&mut s_ref.bindings[i].value, value);
+            s_ref.bindings[i].previous_value = Some(prev);
             return Ok(decl);
         }
         let parent = s_ref.parent.clone();
