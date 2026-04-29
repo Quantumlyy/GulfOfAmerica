@@ -138,9 +138,12 @@ impl Interpreter {
                 Ok(())
             }
             Stmt::Let { .. } => self.exec_let(stmt, self.line),
-            Stmt::Assign { .. } => {
-                Err(self.todo("assignment", stmt_span(stmt)))
-            }
+            Stmt::Assign {
+                target,
+                value,
+                priority: _,
+                span,
+            } => self.exec_assign(target, value, *span, scope),
             other => Err(self.todo(
                 &format!("statement kind {:?}", std::mem::discriminant(other)),
                 stmt_span(other),
@@ -352,37 +355,230 @@ impl Interpreter {
     fn eval_binary(
         &mut self,
         op: BinOp,
-        _lhs: &Expr,
-        _rhs: &Expr,
+        lhs: &Expr,
+        rhs: &Expr,
         span: Span,
-        _scope: &Scope,
+        scope: &Scope,
     ) -> Result<Value, Diagnostic> {
-        // Filled in by the next interpreter chunk.
-        Err(self.todo(&format!("binary operator {op:?}"), span))
+        // For the four equality levels we sometimes care about the *syntactic
+        // shape* of each side (the `====` "different instances are unequal"
+        // rule), so handle them before evaluating.
+        if matches!(op, BinOp::EqExtreme) {
+            let lv = self.eval_expr(lhs, scope)?;
+            let rv = self.eval_expr(rhs, scope)?;
+            return Ok(Value::Bool(BoolVal::from_bool(extreme_eq(lhs, rhs, &lv, &rv))));
+        }
+        let lv = self.eval_expr(lhs, scope)?;
+        let rv = self.eval_expr(rhs, scope)?;
+        match op {
+            BinOp::Add => add(&lv, &rv, span),
+            BinOp::Sub => num_op(&lv, &rv, span, |a, b| a - b, "subtract"),
+            BinOp::Mul => num_op(&lv, &rv, span, |a, b| a * b, "multiply"),
+            BinOp::Div => {
+                let (a, b) = require_numbers(&lv, &rv, span, "divide")?;
+                if b == 0.0 {
+                    Ok(Value::Undefined)
+                } else {
+                    Ok(Value::Number(a / b))
+                }
+            }
+            BinOp::Mod => {
+                let (a, b) = require_numbers(&lv, &rv, span, "%")?;
+                if b == 0.0 {
+                    Ok(Value::Undefined)
+                } else {
+                    Ok(Value::Number(a.rem_euclid(b)))
+                }
+            }
+            BinOp::EqLoose1 => Ok(Value::Bool(BoolVal::from_bool(loose_eq_1(&lv, &rv)))),
+            BinOp::EqLoose2 => Ok(Value::Bool(BoolVal::from_bool(loose_eq_2(&lv, &rv)))),
+            BinOp::EqStrict => Ok(Value::Bool(BoolVal::from_bool(strict_eq(&lv, &rv)))),
+            BinOp::EqExtreme => unreachable!(),
+            BinOp::NotEq => Ok(Value::Bool(BoolVal::from_bool(!loose_eq_2(&lv, &rv)))),
+            BinOp::Lt => num_cmp(&lv, &rv, span, |a, b| a < b),
+            BinOp::Gt => num_cmp(&lv, &rv, span, |a, b| a > b),
+            BinOp::LtEq => num_cmp(&lv, &rv, span, |a, b| a <= b),
+            BinOp::GtEq => num_cmp(&lv, &rv, span, |a, b| a >= b),
+        }
     }
 
     fn eval_member(
         &mut self,
-        _target: &Expr,
-        _name: &str,
+        target: &Expr,
+        name: &str,
         span: Span,
-        _scope: &Scope,
+        scope: &Scope,
     ) -> Result<Value, Diagnostic> {
-        Err(self.todo("member access", span))
+        let v = self.eval_expr(target, scope)?;
+        match &v {
+            Value::Object(o, _) => Ok(o.borrow().get(name).unwrap_or(Value::Undefined)),
+            Value::Instance(inst, _) => {
+                Ok(inst.borrow().fields.get(name).unwrap_or(Value::Undefined))
+            }
+            // `name.pop()` / `name.push(c)` for strings are bound dynamically.
+            Value::String(_, _) => Ok(self.string_method(v.clone(), name, span)),
+            // Likewise for arrays.
+            Value::Array(_, _) => Ok(self.array_method(v.clone(), name, span)),
+            _ => Err(Diagnostic::error(format!(
+                "cannot access member `{name}` on a {}",
+                v.type_name()
+            ))
+            .with_code("E0600")
+            .with_label(Label::primary(
+                span,
+                "this value has no fields or methods",
+            ))),
+        }
+    }
+
+    fn string_method(&self, target: Value, name: &str, _span: Span) -> Value {
+        let target = target;
+        let name = name.to_string();
+        let bf = BuiltinFn {
+            name: "<string method>",
+            call: Box::new(move |_interp, args, span| {
+                string_method_call(&target, &name, args, span)
+            }),
+        };
+        Value::BuiltinFn(Rc::new(bf))
+    }
+
+    fn array_method(&self, target: Value, name: &str, _span: Span) -> Value {
+        let target = target;
+        let name = name.to_string();
+        let bf = BuiltinFn {
+            name: "<array method>",
+            call: Box::new(move |_interp, args, span| {
+                array_method_call(&target, &name, args, span)
+            }),
+        };
+        Value::BuiltinFn(Rc::new(bf))
     }
 
     fn eval_index(
         &mut self,
-        _target: &Expr,
-        _index: &Expr,
+        target: &Expr,
+        index: &Expr,
         span: Span,
-        _scope: &Scope,
+        scope: &Scope,
     ) -> Result<Value, Diagnostic> {
-        Err(self.todo("indexing", span))
+        let v = self.eval_expr(target, scope)?;
+        let i = self.eval_expr(index, scope)?;
+        match (&v, &i) {
+            (Value::Array(arr, _), Value::Number(n)) => {
+                let arr = arr.borrow();
+                let real = (*n + 1.0).round() as i64;
+                if real < 0 || real as usize >= arr.len() {
+                    Ok(Value::Undefined)
+                } else {
+                    Ok(arr[real as usize].clone())
+                }
+            }
+            (Value::String(s, _), Value::Number(n)) => {
+                let s = s.borrow();
+                let real = (*n + 1.0).round() as i64;
+                if real < 0 || real as usize >= s.len() {
+                    Ok(Value::Undefined)
+                } else {
+                    let c = s[real as usize];
+                    let mut buf = Vec::new();
+                    buf.push(c);
+                    Ok(Value::String(
+                        Rc::new(RefCell::new(buf)),
+                        crate::value::fresh_id(),
+                    ))
+                }
+            }
+            (Value::Object(o, _), key) => {
+                let key_str = key.display();
+                Ok(o.borrow().get(&key_str).unwrap_or(Value::Undefined))
+            }
+            _ => Err(Diagnostic::error(format!(
+                "cannot index a {} with a {}",
+                v.type_name(),
+                i.type_name()
+            ))
+            .with_code("E0601")
+            .with_label(Label::primary(span, "indexing not supported here"))),
+        }
     }
 
     pub(crate) fn format_expr_source(&self, _expr: &Expr) -> String {
+        // Best-effort: caller can render via spans if needed.
         "<expr>".to_string()
+    }
+
+    fn exec_assign(
+        &mut self,
+        target: &Expr,
+        value: &Expr,
+        span: Span,
+        scope: &Scope,
+    ) -> Result<(), Diagnostic> {
+        let v = self.eval_expr(value, scope)?;
+        match target {
+            Expr::Ident { name, span: name_span } => {
+                // Reassignment: requires the binding to be `var const` or
+                // `var var`.
+                let decl = match env::reassign(scope, name, v.clone(), self.line, self.start_time) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        if env::was_ever_declared(scope, name) {
+                            // Bound once but expired or hidden.
+                            return Err(Diagnostic::error(format!("`{name}` has expired"))
+                                .with_code("E0302")
+                                .with_label(Label::primary(*name_span, "no live binding")));
+                        }
+                        // Implicit declaration as `var var`.
+                        env::insert(
+                            scope,
+                            Binding {
+                                name: name.clone(),
+                                value: v,
+                                decl: DeclKind::VarVar,
+                                priority: 0,
+                                created_line: self.line,
+                                created_at: Instant::now(),
+                                lifetime: None,
+                                eternal: false,
+                            },
+                        );
+                        return Ok(());
+                    }
+                };
+                if !decl.reassignable() {
+                    return Err(Diagnostic::error(format!(
+                        "cannot reassign `{name}`"
+                    ))
+                    .with_code("E0700")
+                    .with_label(Label::primary(
+                        *name_span,
+                        format!(
+                            "this variable was declared as `{}`, which forbids reassignment",
+                            decl.label()
+                        ),
+                    ))
+                    .with_note(
+                        "to allow reassignment, declare it as `var const` or `var var`.",
+                    ));
+                }
+                Ok(())
+            }
+            Expr::Index { target, index, .. } => {
+                let arr = self.eval_expr(target, scope)?;
+                let idx = self.eval_expr(index, scope)?;
+                index_assign(&arr, &idx, v, span)
+            }
+            Expr::Member { target, name, .. } => {
+                let obj = self.eval_expr(target, scope)?;
+                member_assign(&obj, name, v, span)
+            }
+            _ => Err(Diagnostic::error(
+                "the left-hand side of `=` must be a name, member access, or index",
+            )
+            .with_code("E0701")
+            .with_label(Label::primary(span, "this is not assignable"))),
+        }
     }
 
     pub(crate) fn todo(&self, what: &str, span: Span) -> Diagnostic {
@@ -443,3 +639,304 @@ fn stmt_span(s: &Stmt) -> Span {
 
 #[allow(dead_code)]
 fn _used_in_later_commits(_: DeclKind, _: &mut BuiltinFn) {}
+
+// ===========================================================================
+// Equality, arithmetic, and value-coercion helpers.
+// ===========================================================================
+
+/// `=` — least-precise comparison. Numbers are compared after rounding to the
+/// nearest integer (so `3 = 3.14` is `true`); booleans compare loosely;
+/// otherwise this falls back to JS-loose-`==` semantics.
+fn loose_eq_1(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => (x.round() - y.round()).abs() < f64::EPSILON,
+        (Value::Number(x), Value::Bool(b)) | (Value::Bool(b), Value::Number(x)) => {
+            (x.round() != 0.0) == b.is_truthy()
+        }
+        _ => loose_eq_2(a, b),
+    }
+}
+
+/// `==` — JS-style loose equality. Numbers and strings coerce to numbers; `maybe`
+/// matches anything; otherwise structural equality.
+fn loose_eq_2(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Bool(BoolVal::Maybe), _) | (_, Value::Bool(BoolVal::Maybe)) => true,
+        (Value::Number(x), Value::Number(y)) => {
+            (x.is_nan() && y.is_nan()) || (x - y).abs() < f64::EPSILON
+        }
+        (Value::String(x, _), Value::String(y, _)) => *x.borrow() == *y.borrow(),
+        (Value::Number(n), Value::String(s, _)) | (Value::String(s, _), Value::Number(n)) => {
+            let s: String = s.borrow().iter().collect();
+            s.parse::<f64>().is_ok_and(|sn| (sn - *n).abs() < f64::EPSILON)
+        }
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Undefined, Value::Undefined) => true,
+        (Value::Null, Value::Null) => true,
+        (Value::Undefined, Value::Null) | (Value::Null, Value::Undefined) => true,
+        _ => strict_eq(a, b),
+    }
+}
+
+/// `===` — strict equality: same type AND same value.
+fn strict_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => (x - y).abs() < f64::EPSILON,
+        (Value::String(x, _), Value::String(y, _)) => *x.borrow() == *y.borrow(),
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Undefined, Value::Undefined) => true,
+        (Value::Null, Value::Null) => true,
+        _ => false,
+    }
+}
+
+/// `====` — extreme equality. Two values share an identity iff they were
+/// minted from the same allocation. For literals, equal values share an
+/// identity; for variables, only the same variable does. So:
+///
+/// * `pi ==== pi` is `true` (same expression);
+/// * `3.14 ==== 3.14` is `true` (literal == same literal value);
+/// * `3.14 ==== pi` is `false` (literal vs. variable, different "instances").
+fn extreme_eq(lhs_expr: &Expr, rhs_expr: &Expr, lv: &Value, rv: &Value) -> bool {
+    let lhs_kind = expr_shape(lhs_expr);
+    let rhs_kind = expr_shape(rhs_expr);
+    match (lhs_kind, rhs_kind) {
+        (ExprShape::Ident(a), ExprShape::Ident(b)) => a == b && strict_eq(lv, rv),
+        (ExprShape::Literal, ExprShape::Literal) => strict_eq(lv, rv),
+        // Mixed shapes: only true if the underlying allocations match.
+        _ => match (lv.instance_id(), rv.instance_id()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        },
+    }
+}
+
+#[derive(PartialEq)]
+enum ExprShape<'a> {
+    Ident(&'a str),
+    Literal,
+    Other,
+}
+
+fn expr_shape(e: &Expr) -> ExprShape<'_> {
+    match e {
+        Expr::Ident { name, .. } => ExprShape::Ident(name),
+        Expr::Number { .. }
+        | Expr::String { .. }
+        | Expr::Bool { .. }
+        | Expr::Null { .. }
+        | Expr::Undefined { .. } => ExprShape::Literal,
+        _ => ExprShape::Other,
+    }
+}
+
+fn add(a: &Value, b: &Value, span: Span) -> Result<Value, Diagnostic> {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x + y)),
+        (Value::String(_, _), _) | (_, Value::String(_, _)) => {
+            let combined = format!("{}{}", a.display(), b.display());
+            let chars: Vec<char> = combined.chars().collect();
+            Ok(Value::String(
+                Rc::new(RefCell::new(chars)),
+                crate::value::fresh_id(),
+            ))
+        }
+        _ => Err(Diagnostic::error(format!(
+            "cannot add a {} and a {}",
+            a.type_name(),
+            b.type_name()
+        ))
+        .with_code("E0500")
+        .with_label(Label::primary(span, "this addition isn't well-defined"))),
+    }
+}
+
+fn num_op(
+    a: &Value,
+    b: &Value,
+    span: Span,
+    f: fn(f64, f64) -> f64,
+    op_name: &str,
+) -> Result<Value, Diagnostic> {
+    let (x, y) = require_numbers(a, b, span, op_name)?;
+    Ok(Value::Number(f(x, y)))
+}
+
+fn num_cmp(
+    a: &Value,
+    b: &Value,
+    span: Span,
+    f: fn(f64, f64) -> bool,
+) -> Result<Value, Diagnostic> {
+    let (x, y) = require_numbers(a, b, span, "compare")?;
+    Ok(Value::Bool(BoolVal::from_bool(f(x, y))))
+}
+
+fn require_numbers(
+    a: &Value,
+    b: &Value,
+    span: Span,
+    op_name: &str,
+) -> Result<(f64, f64), Diagnostic> {
+    let x = coerce_number(a).ok_or_else(|| {
+        Diagnostic::error(format!("cannot {op_name} a {}", a.type_name()))
+            .with_code("E0500")
+            .with_label(Label::primary(span, "expected a number here"))
+    })?;
+    let y = coerce_number(b).ok_or_else(|| {
+        Diagnostic::error(format!("cannot {op_name} a {}", b.type_name()))
+            .with_code("E0500")
+            .with_label(Label::primary(span, "expected a number here"))
+    })?;
+    Ok((x, y))
+}
+
+fn coerce_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => Some(*n),
+        Value::Bool(b) => Some(if b.is_truthy() { 1.0 } else { 0.0 }),
+        Value::String(s, _) => {
+            let s: String = s.borrow().iter().collect();
+            s.parse().ok()
+        }
+        _ => None,
+    }
+}
+
+// ===========================================================================
+// Assignment helpers.
+// ===========================================================================
+
+fn index_assign(arr: &Value, idx: &Value, value: Value, span: Span) -> Result<(), Diagnostic> {
+    match (arr, idx) {
+        (Value::Array(a, _), Value::Number(n)) => {
+            let mut a = a.borrow_mut();
+            let real = *n + 1.0;
+            // Float index = insertion at `floor(real) + 1`. So `[3,2,5]` with
+            // `arr[0.5] = 4` -> real = 1.5 -> insert before index 2 ->
+            // `[3, 2, 4, 5]`.
+            if real.fract() != 0.0 {
+                let pos = real.ceil() as i64;
+                let pos = pos.clamp(0, a.len() as i64) as usize;
+                a.insert(pos, value);
+            } else {
+                let pos = real as i64;
+                if pos < 0 {
+                    return Err(Diagnostic::error("array index out of range")
+                        .with_code("E0602")
+                        .with_label(Label::primary(span, "index < -1")));
+                }
+                let pos = pos as usize;
+                if pos >= a.len() {
+                    a.resize(pos + 1, Value::Undefined);
+                }
+                a[pos] = value;
+            }
+            Ok(())
+        }
+        (Value::Object(o, _), key) => {
+            o.borrow_mut().set(&key.display(), value);
+            Ok(())
+        }
+        _ => Err(Diagnostic::error(format!(
+            "cannot index-assign into a {}",
+            arr.type_name()
+        ))
+        .with_code("E0603")
+        .with_label(Label::primary(span, "this is not an array or object"))),
+    }
+}
+
+fn member_assign(target: &Value, name: &str, value: Value, span: Span) -> Result<(), Diagnostic> {
+    match target {
+        Value::Object(o, _) => {
+            o.borrow_mut().set(name, value);
+            Ok(())
+        }
+        Value::Instance(inst, _) => {
+            inst.borrow_mut().fields.set(name, value);
+            Ok(())
+        }
+        _ => Err(Diagnostic::error(format!(
+            "cannot assign to `.{name}` on a {}",
+            target.type_name()
+        ))
+        .with_code("E0604")
+        .with_label(Label::primary(span, "this value has no fields"))),
+    }
+}
+
+// ===========================================================================
+// Built-in string and array methods.
+// ===========================================================================
+
+fn string_method_call(
+    target: &Value,
+    name: &str,
+    args: Vec<Value>,
+    span: Span,
+) -> Result<Value, Diagnostic> {
+    let Value::String(s, _) = target else {
+        unreachable!()
+    };
+    match name {
+        "pop" => {
+            let popped = s.borrow_mut().pop();
+            Ok(popped
+                .map(|c| {
+                    Value::String(
+                        Rc::new(RefCell::new(vec![c])),
+                        crate::value::fresh_id(),
+                    )
+                })
+                .unwrap_or(Value::Undefined))
+        }
+        "push" => {
+            for a in &args {
+                if let Value::String(arg_s, _) = a {
+                    for c in arg_s.borrow().iter() {
+                        s.borrow_mut().push(*c);
+                    }
+                } else {
+                    let txt = a.display();
+                    for c in txt.chars() {
+                        s.borrow_mut().push(c);
+                    }
+                }
+            }
+            Ok(Value::Undefined)
+        }
+        "length" => Ok(Value::Number(s.borrow().len() as f64)),
+        other => Err(Diagnostic::error(format!(
+            "no string method `{other}`"
+        ))
+        .with_code("E0610")
+        .with_label(Label::primary(span, "unknown string method"))),
+    }
+}
+
+fn array_method_call(
+    target: &Value,
+    name: &str,
+    args: Vec<Value>,
+    span: Span,
+) -> Result<Value, Diagnostic> {
+    let Value::Array(a, _) = target else {
+        unreachable!()
+    };
+    match name {
+        "pop" => Ok(a.borrow_mut().pop().unwrap_or(Value::Undefined)),
+        "push" => {
+            for v in args {
+                a.borrow_mut().push(v);
+            }
+            Ok(Value::Undefined)
+        }
+        "length" => Ok(Value::Number(a.borrow().len() as f64)),
+        other => Err(Diagnostic::error(format!(
+            "no array method `{other}`"
+        ))
+        .with_code("E0611")
+        .with_label(Label::primary(span, "unknown array method"))),
+    }
+}
