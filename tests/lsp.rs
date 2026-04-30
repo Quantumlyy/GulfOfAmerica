@@ -171,3 +171,49 @@ fn find_definition_returns_none_for_unknown_name() {
     let src = "const const x = 1!";
     assert!(find_definition(src, "nope").is_none());
 }
+
+#[test]
+fn find_definition_descends_into_function_bodies() {
+    let src = r#"
+function outer() => {
+   const const helper = 7!
+   print(helper)!
+}
+"#;
+    let span = find_definition(src, "helper").expect("expected to find inner decl");
+    let snippet = &src[span.start..span.end];
+    assert!(snippet.contains("helper"), "snippet: {snippet:?}");
+}
+
+#[test]
+fn find_definition_descends_into_class_methods() {
+    let src = r#"
+class Box {
+   const const tag = "boxy"!
+   function open() => {
+      const const inner = 1!
+      print(inner)!
+   }
+}
+"#;
+    assert!(find_definition(src, "tag").is_some(), "tag is a class field");
+    assert!(find_definition(src, "open").is_some(), "open is a method");
+    assert!(find_definition(src, "inner").is_some(), "inner is local to open");
+}
+
+#[test]
+fn diagnostics_reports_multiple_errors_per_file() {
+    let src = "\
+const const x = !
+const const y = !
+print(1)!
+const const z = !
+";
+    let diags = compute_diagnostics(src);
+    assert!(
+        diags.len() >= 2,
+        "expected several diagnostics from a multi-error buffer, got {} ({:#?})",
+        diags.len(),
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}

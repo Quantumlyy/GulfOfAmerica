@@ -13,9 +13,24 @@ use crate::diagnostic::{Diagnostic, Label};
 use crate::source::{SourceFile, Span};
 use crate::token::{Token, TokenKind};
 
+/// Parse and return the first diagnostic on failure. Kept as a thin wrapper
+/// over [`parse_recovering`] for callers that don't need multi-error
+/// reporting.
 pub fn parse(file: &SourceFile, tokens: Vec<Token>) -> Result<Program, Diagnostic> {
+    let (program, mut diags) = parse_recovering(file, tokens);
+    if diags.is_empty() {
+        Ok(program)
+    } else {
+        Err(diags.remove(0))
+    }
+}
+
+/// Parse with error recovery. Always returns a [`Program`] (possibly with
+/// holes around recovery points) plus every diagnostic encountered. An
+/// empty `Vec` means a clean parse.
+pub fn parse_recovering(file: &SourceFile, tokens: Vec<Token>) -> (Program, Vec<Diagnostic>) {
     let mut p = Parser::new(file, tokens);
-    p.parse_program()
+    p.parse_program_recovering()
 }
 
 pub(crate) struct Parser<'a> {

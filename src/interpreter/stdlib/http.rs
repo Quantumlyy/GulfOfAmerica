@@ -104,6 +104,8 @@ struct Url {
 }
 
 fn parse_url(url: &str, span: Span) -> Result<Url, Diagnostic> {
+    // Fragments never go on the wire — strip them before splitting.
+    let url = url.split_once('#').map_or(url, |(head, _)| head);
     let Some((scheme, rest)) = url.split_once("://") else {
         return Err(err(span, format!("malformed URL `{url}`: missing scheme")));
     };
@@ -193,17 +195,32 @@ fn do_request(
     extra_headers: &[(String, String)],
     span: Span,
 ) -> Result<Value, Diagnostic> {
+    // Programmer errors (bad URL, unsupported scheme) bubble up as
+    // Diagnostics. Transient I/O errors come back as `{ok: false, error}`
+    // so user code can branch on them without aborting the program.
     let parsed = parse_url(url, span)?;
+    Ok(match try_request(method, &parsed, body, extra_headers) {
+        Ok(v) => v,
+        Err(msg) => error_response(&msg),
+    })
+}
+
+fn try_request(
+    method: &str,
+    parsed: &Url,
+    body: &str,
+    extra_headers: &[(String, String)],
+) -> Result<Value, String> {
     let addr_str = format!("{}:{}", parsed.host, parsed.port);
     let addrs: Vec<_> = addr_str
         .to_socket_addrs()
-        .map_err(|e| err(span, format!("could not resolve `{addr_str}`: {e}")))?
+        .map_err(|e| format!("could not resolve `{addr_str}`: {e}"))?
         .collect();
     if addrs.is_empty() {
-        return Err(err(span, format!("no addresses resolved for `{addr_str}`")));
+        return Err(format!("no addresses resolved for `{addr_str}`"));
     }
     let mut stream = TcpStream::connect(&addrs[..])
-        .map_err(|e| err(span, format!("could not connect to `{addr_str}`: {e}")))?;
+        .map_err(|e| format!("could not connect to `{addr_str}`: {e}"))?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
 
@@ -220,9 +237,9 @@ fn do_request(
         if k.eq_ignore_ascii_case("content-type") {
             sent_ct = true;
         }
-        // The `host`, `connection` and `content-length` headers we emit
-        // ourselves are authoritative; user-supplied duplicates are kept so
-        // that explicit overrides still go on the wire.
+        // `host`, `connection`, and `content-length` we emit ourselves;
+        // user-supplied duplicates still go on the wire so explicit
+        // overrides win.
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     if !sent_ct && !body.is_empty() {
@@ -232,43 +249,71 @@ fn do_request(
     req.push_str(body);
     stream
         .write_all(req.as_bytes())
-        .map_err(|e| err(span, format!("write failed: {e}")))?;
+        .map_err(|e| format!("write failed: {e}"))?;
 
     let mut buf = Vec::new();
     stream
         .read_to_end(&mut buf)
-        .map_err(|e| err(span, format!("read failed: {e}")))?;
-    parse_response(&buf, span)
+        .map_err(|e| format!("read failed: {e}"))?;
+    parse_response(&buf)
 }
 
-fn parse_response(bytes: &[u8], span: Span) -> Result<Value, Diagnostic> {
+fn error_response(message: &str) -> Value {
+    obj(vec![
+        ("ok", Value::Bool(crate::value::BoolVal::False)),
+        ("error", s(message.to_string())),
+        ("status", Value::Number(0.0)),
+        ("body", s(String::new())),
+        (
+            "headers",
+            Value::Object(Rc::new(RefCell::new(Object::new())), fresh_id()),
+        ),
+    ])
+}
+
+fn parse_response(bytes: &[u8]) -> Result<Value, String> {
     let split = find_double_crlf(bytes)
-        .ok_or_else(|| err(span, "malformed response: missing header terminator"))?;
+        .ok_or_else(|| "malformed response: missing header terminator".to_string())?;
     let head = std::str::from_utf8(&bytes[..split])
-        .map_err(|_| err(span, "response headers were not valid UTF-8"))?;
+        .map_err(|_| "response headers were not valid UTF-8".to_string())?;
     let body_bytes = &bytes[split + 4..];
 
     let mut lines = head.split("\r\n");
-    let status_line = lines.next().ok_or_else(|| err(span, "empty response"))?;
+    let status_line = lines
+        .next()
+        .ok_or_else(|| "empty response".to_string())?;
     let mut status_parts = status_line.splitn(3, ' ');
     let _version = status_parts.next();
     let status: u16 = status_parts
         .next()
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| err(span, format!("malformed status line: {status_line}")))?;
+        .ok_or_else(|| format!("malformed status line: {status_line}"))?;
     let reason = status_parts.next().unwrap_or("").to_string();
 
     let mut headers = Object::new();
+    let mut chunked = false;
     for line in lines {
         if line.is_empty() {
             continue;
         }
         if let Some((k, v)) = line.split_once(':') {
-            headers.set(&k.trim().to_lowercase(), s(v.trim().to_string()));
+            let key = k.trim().to_lowercase();
+            let val = v.trim();
+            if key == "transfer-encoding" && val.eq_ignore_ascii_case("chunked") {
+                chunked = true;
+            }
+            headers.set(&key, s(val.to_string()));
         }
     }
-    let body_str = String::from_utf8_lossy(body_bytes).into_owned();
+
+    let body_bytes_owned: Vec<u8> = if chunked {
+        decode_chunked(body_bytes).map_err(|e| format!("chunked decode failed: {e}"))?
+    } else {
+        body_bytes.to_vec()
+    };
+    let body_str = String::from_utf8_lossy(&body_bytes_owned).into_owned();
     Ok(obj(vec![
+        ("ok", Value::Bool(crate::value::BoolVal::True)),
         ("status", Value::Number(f64::from(status))),
         ("reason", s(reason)),
         ("body", s(body_str)),
@@ -281,6 +326,45 @@ fn parse_response(bytes: &[u8], span: Span) -> Result<Value, Diagnostic> {
 
 fn find_double_crlf(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Decode a `Transfer-Encoding: chunked` body. Format per RFC 7230 §4.1:
+///
+/// ```text
+/// chunk          = chunk-size [ chunk-ext ] CRLF chunk-data CRLF
+/// last-chunk     = 1*("0") [ chunk-ext ] CRLF
+/// trailer-part   = *( header-field CRLF )
+/// ```
+///
+/// We ignore chunk extensions and trailer headers. Returns the concatenated
+/// chunk data on success.
+fn decode_chunked(mut bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = bytes
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| "expected chunk size".to_string())?;
+        let size_line = std::str::from_utf8(&bytes[..line_end])
+            .map_err(|_| "chunk size was not UTF-8".to_string())?;
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| format!("invalid chunk size `{size_hex}`"))?;
+        bytes = &bytes[line_end + 2..];
+        if size == 0 {
+            // Optional trailer-part follows; we ignore it. End on the
+            // mandatory blank line.
+            return Ok(out);
+        }
+        if bytes.len() < size + 2 {
+            return Err("chunk body truncated".into());
+        }
+        out.extend_from_slice(&bytes[..size]);
+        if &bytes[size..size + 2] != b"\r\n" {
+            return Err("chunk not terminated by CRLF".into());
+        }
+        bytes = &bytes[size + 2..];
+    }
 }
 
 // ---------------------------------------------------------------------------

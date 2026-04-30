@@ -244,10 +244,11 @@ pub fn compute_diagnostics(text: &str) -> Vec<LspDiagnostic> {
         Ok(t) => t,
         Err(d) => return vec![lsp_diag_from(text, &d)],
     };
-    match crate::parser::parse(&file, tokens) {
-        Ok(_) => Vec::new(),
-        Err(d) => vec![lsp_diag_from(text, &d)],
-    }
+    let (_, parse_diags) = crate::parser::parse_recovering(&file, tokens);
+    parse_diags
+        .iter()
+        .map(|d| lsp_diag_from(text, d))
+        .collect()
 }
 
 fn lsp_diag_from(text: &str, d: &GulfDiagnostic) -> LspDiagnostic {
@@ -384,9 +385,9 @@ pub fn collect_symbols(text: &str) -> Vec<DocumentSymbol> {
     let Ok(tokens) = crate::lexer::lex(&file) else {
         return Vec::new();
     };
-    let Ok(program) = crate::parser::parse(&file, tokens) else {
-        return Vec::new();
-    };
+    // Recovering parser: emit symbols for whatever statements survived,
+    // even if the file has errors elsewhere.
+    let (program, _diags) = crate::parser::parse_recovering(&file, tokens);
     let mut out = Vec::new();
     for f in &program.files {
         for stmt in &f.stmts {
@@ -499,10 +500,10 @@ fn make_symbol(
 pub fn find_definition(text: &str, name: &str) -> Option<Span> {
     let file = SourceFile::new("(buffer)".into(), text.to_string());
     let tokens = crate::lexer::lex(&file).ok()?;
-    let program = crate::parser::parse(&file, tokens).ok()?;
+    let (program, _) = crate::parser::parse_recovering(&file, tokens);
     for f in &program.files {
         for stmt in &f.stmts {
-            if let Some(s) = decl_span_named(stmt, name) {
+            if let Some(s) = decl_span_in_stmt(stmt, name) {
                 return Some(s);
             }
         }
@@ -510,14 +511,87 @@ pub fn find_definition(text: &str, name: &str) -> Option<Span> {
     None
 }
 
-fn decl_span_named(stmt: &Stmt, name: &str) -> Option<Span> {
+/// Find the span of a declaration named `name`, descending into function
+/// bodies, class methods, and `if` / `when` blocks. The first match wins —
+/// good enough for navigation; not a real resolver.
+fn decl_span_in_stmt(stmt: &Stmt, name: &str) -> Option<Span> {
+    use crate::ast::{Block, ClassMember, FnBody};
+
+    fn walk_block(block: &Block, name: &str) -> Option<Span> {
+        for s in &block.stmts {
+            if let Some(s) = decl_span_in_stmt(s, name) {
+                return Some(s);
+            }
+        }
+        None
+    }
+    fn walk_body(body: &FnBody, name: &str) -> Option<Span> {
+        match body {
+            FnBody::Expr(_) => None,
+            FnBody::Block(b) => walk_block(b, name),
+        }
+    }
+
     match stmt {
-        Stmt::FnDecl { name: n, span, .. } if n == name => Some(*span),
-        Stmt::ClassDecl { name: n, span, .. } if n == name => Some(*span),
+        Stmt::FnDecl {
+            name: n,
+            span,
+            body,
+            ..
+        } => {
+            if n == name {
+                return Some(*span);
+            }
+            walk_body(body, name)
+        }
+        Stmt::ClassDecl {
+            name: n,
+            members,
+            span,
+        } => {
+            if n == name {
+                return Some(*span);
+            }
+            for m in members {
+                match m {
+                    ClassMember::Method {
+                        name: mn,
+                        span,
+                        body,
+                        ..
+                    } => {
+                        if mn == name {
+                            return Some(*span);
+                        }
+                        if let Some(s) = walk_body(body, name) {
+                            return Some(s);
+                        }
+                    }
+                    ClassMember::Field {
+                        name: fname, span, ..
+                    } => {
+                        if fname == name {
+                            return Some(*span);
+                        }
+                    }
+                }
+            }
+            None
+        }
         Stmt::Let {
             target: BindingTarget::Ident { name: n, span },
             ..
         } if n == name => Some(*span),
+        Stmt::If {
+            then_block,
+            else_block,
+            ..
+        } => walk_block(then_block, name).or_else(|| {
+            else_block
+                .as_ref()
+                .and_then(|b| walk_block(b, name))
+        }),
+        Stmt::When { block, .. } => walk_block(block, name),
         _ => None,
     }
 }

@@ -47,8 +47,8 @@ error[E0700]: cannot reassign `name`
 ## Feature matrix
 
 Every example in the upstream README has a corresponding integration test in
-`tests/spec.rs`. **78 of 78 spec tests pass** in this implementation, plus
-33 lexer/parser unit tests and 7 std http tests.
+`tests/spec.rs`. **78 of 78 upstream spec tests pass**, plus 33 lexer/parser
+unit tests, 11 std http tests, and a parser-recovery test.
 
 | Spec section | Status | Notes |
 | --- | --- | --- |
@@ -91,7 +91,7 @@ keep their semantics.
 
 | Package | Surface |
 | --- | --- |
-| `http` | `http.get(url)`, `http.post(url, body)`, `http.request({method, url, body, headers})`, `http.serve(addr, handler)`, `http.serve_once(addr, handler)`. Plain HTTP/1.1 over TCP — no TLS. Handlers receive `{method, path, body, headers}` and may return a string body or a `{status, body, headers, reason}` object. |
+| `http` | `http.get(url)`, `http.post(url, body)`, `http.request({method, url, body, headers})`, `http.serve(addr, handler)`, `http.serve_once(addr, handler)`. Plain HTTP/1.1 over TCP — no TLS. Successful responses are `{ok: true, status, reason, body, headers}`. Connection / parse failures come back as data: `{ok: false, error, status: 0, body: "", headers: {}}` so user code can branch instead of aborting. The client decodes `Transfer-Encoding: chunked`. Handlers receive `{method, path, body, headers}` and may return a string body or a `{status, body, headers, reason}` object. |
 
 ```text
 import http!
@@ -114,12 +114,13 @@ Then point your editor at the `gulf-lsp` binary as the language server for
 `gulf` / `dreamberd` / `*.gom`. Capabilities in v0:
 
 - **Diagnostics** on open/change/save — lex + parse errors, with codes and
-  notes preserved.
+  notes preserved. The parser recovers past statement-level errors so a
+  single broken line doesn't hide every other one in the file.
 - **Hover** for keywords, builtins, and the `http` std package.
 - **Document symbols** for top-level `function` / `class` / `let`s, with
   class fields and methods nested as children.
-- **Goto-definition** for identifiers that resolve to a top-level binding
-  in the same file.
+- **Goto-definition** for identifiers that resolve to a binding declared
+  at top level, inside a function body, or as a class method/field.
 
 Completion, semantic tokens, and formatting are intentionally out of scope
 for the first cut.
@@ -156,8 +157,8 @@ under `#![forbid(unsafe_code)]`.
 ## Tests
 
 ```sh
-cargo test                     # 118: 33 unit + 78 spec + 7 http
-cargo test --features lsp      # adds 11 lsp tests
+cargo test                     # 122: 33 unit + 89 spec
+cargo test --features lsp      # adds 14 lsp tests (= 136 total)
 cargo clippy --all-targets
 ```
 

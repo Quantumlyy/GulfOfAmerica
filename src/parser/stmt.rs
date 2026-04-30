@@ -39,17 +39,21 @@ impl Terminator {
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn parse_program(&mut self) -> Result<Program, Diagnostic> {
+    /// Recovering top-level entry. Continues past statement-level errors so
+    /// the LSP / `gulf check` can surface every diagnostic in one pass.
+    pub(crate) fn parse_program_recovering(&mut self) -> (Program, Vec<Diagnostic>) {
         let mut files = Vec::new();
+        let mut diags: Vec<Diagnostic> = Vec::new();
         let mut current_name: Option<String> = None;
         loop {
-            // Optional file separator at the very start (with optional name).
             if matches!(self.peek().kind, TokenKind::FileSeparator) {
-                let name = self.parse_file_separator_name()?;
-                if !files.is_empty() || current_name.is_some() {
-                    // Already inside a file; close it before starting a new one.
+                match self.parse_file_separator_name() {
+                    Ok(name) => current_name = name,
+                    Err(d) => {
+                        diags.push(d);
+                        self.recover_to_sync_point();
+                    }
                 }
-                current_name = name;
                 continue;
             }
             if self.at_eof() {
@@ -59,7 +63,19 @@ impl<'a> Parser<'a> {
             while !self.at_eof()
                 && !matches!(self.peek().kind, TokenKind::FileSeparator)
             {
-                stmts.push(self.parse_stmt()?);
+                let before = self.pos;
+                match self.parse_stmt() {
+                    Ok(s) => stmts.push(s),
+                    Err(d) => {
+                        diags.push(d);
+                        self.recover_to_sync_point();
+                        // If recovery didn't advance, force-bump so we never
+                        // spin on the same broken token.
+                        if self.pos == before && !self.at_eof() {
+                            self.bump();
+                        }
+                    }
+                }
             }
             files.push(File {
                 name: current_name.take(),
@@ -72,7 +88,44 @@ impl<'a> Parser<'a> {
                 stmts: Vec::new(),
             });
         }
-        Ok(Program { files })
+        (Program { files }, diags)
+    }
+
+    /// Skip tokens until the start of the next statement looks plausible:
+    /// past a statement terminator (`!` / `?` / `¡`), or up to a file
+    /// separator, EOF, or a statement-starting keyword.
+    fn recover_to_sync_point(&mut self) {
+        let mut consumed_anything = false;
+        loop {
+            match &self.peek().kind {
+                TokenKind::Eof | TokenKind::FileSeparator => return,
+                TokenKind::Bang(_) | TokenKind::Question(_) | TokenKind::InvertedBang(_) => {
+                    self.bump();
+                    return;
+                }
+                // Once we've moved past at least one token, a fresh
+                // statement-starting keyword is a good place to resume.
+                TokenKind::Const
+                | TokenKind::Var
+                | TokenKind::If
+                | TokenKind::When
+                | TokenKind::Class
+                | TokenKind::ClassName
+                | TokenKind::FnKeyword
+                | TokenKind::Async
+                | TokenKind::Return
+                | TokenKind::Delete
+                | TokenKind::Export
+                    if consumed_anything =>
+                {
+                    return;
+                }
+                _ => {
+                    self.bump();
+                    consumed_anything = true;
+                }
+            }
+        }
     }
 
     /// Consume a `=====` file-separator token plus any optional `name.gom`

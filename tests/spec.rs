@@ -1119,3 +1119,122 @@ http.get("https://example.com")!
         &["only http://"],
     );
 }
+
+#[test]
+fn http_successful_response_includes_ok_true() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let src = format!(
+        r#"
+import http!
+const const res = http.get("http://127.0.0.1:{port}/")!
+print(res.ok)!
+print(res.status)!
+"#
+    );
+    let s = out(&src);
+    server.join().unwrap();
+    assert_eq!(s, "true\n200\n");
+}
+
+#[test]
+fn http_connect_failure_returns_ok_false_instead_of_aborting() {
+    // Port 1 should refuse a TCP connection on most systems. We intentionally
+    // never bind it: the test asserts that `http.get` against an unreachable
+    // address returns a result-shaped value with `ok: false`, lets the rest
+    // of the program run, and exposes a non-empty `error` field.
+    let src = r#"
+import http!
+const const res = http.get("http://127.0.0.1:1/")!
+print(res.ok)!
+print(res.status)!
+print(res.error.length() > 0)!
+print("after")!
+"#;
+    let s = out(src);
+    let lines: Vec<&str> = s.lines().collect();
+    assert_eq!(lines.len(), 4, "output: {s:?}");
+    assert_eq!(lines[0], "false");
+    assert_eq!(lines[1], "0");
+    assert_eq!(lines[2], "true");
+    assert_eq!(lines[3], "after");
+}
+
+#[test]
+fn http_decodes_chunked_response_body() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        // Three chunks: "Wiki", "pedia", " in chunks." then terminator.
+        let response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                        4\r\nWiki\r\n\
+                        5\r\npedia\r\n\
+                        b\r\n in chunks.\r\n\
+                        0\r\n\r\n";
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let src = format!(
+        r#"
+import http!
+const const res = http.get("http://127.0.0.1:{port}/")!
+print(res.body)!
+"#
+    );
+    let s = out(&src);
+    server.join().unwrap();
+    assert_eq!(s, "Wikipedia in chunks.\n");
+}
+
+// ---------------------------------------------------------------------------
+// § Parser recovery — multiple errors per pass.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parser_reports_every_error_in_one_pass() {
+    use gulf::{lexer, parser, source::SourceFile};
+
+    let src = "\
+print(1)
+const const x = !
+print(2)!
+class
+function 3 => 4!
+print(3)!
+";
+    let file = SourceFile::new("multi.gom".into(), src.into());
+    let tokens = lexer::lex(&file).expect("lexer should succeed");
+    let (program, diags) = parser::parse_recovering(&file, tokens);
+    assert!(
+        diags.len() >= 2,
+        "expected multiple parse diagnostics, got {}: {:#?}",
+        diags.len(),
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+    // The recovering parser should have salvaged at least one good statement
+    // — concretely, the `print(2)!` that follows the broken `const const`.
+    let total_stmts: usize = program.files.iter().map(|f| f.stmts.len()).sum();
+    assert!(
+        total_stmts >= 1,
+        "expected at least one statement to survive recovery"
+    );
+}
