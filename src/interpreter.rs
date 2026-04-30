@@ -12,6 +12,7 @@
 //!    separators.
 
 mod builtins;
+mod stdlib;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -706,6 +707,35 @@ impl Interpreter {
             vs.push(self.eval_expr(a, scope)?);
         }
         self.invoke(f, vs, callee, span)
+    }
+
+    /// Invoke a callable value without an originating callee expression.
+    /// Used by stdlib code paths (e.g. an http server dispatching a user
+    /// handler) where we have a [`Value`] in hand but no surrounding AST.
+    pub(crate) fn invoke_value(
+        &mut self,
+        f: Value,
+        vs: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
+        match f {
+            Value::BuiltinFn(bf) => (bf.call)(self, vs, span),
+            Value::Function(func) => self.invoke_user_fn(&func, vs, span),
+            Value::Signal(sig, _) => {
+                if vs.is_empty() {
+                    Ok(sig.borrow().current.clone())
+                } else {
+                    sig.borrow_mut().current = vs.into_iter().next().unwrap();
+                    Ok(Value::Undefined)
+                }
+            }
+            other => Err(Diagnostic::error(format!(
+                "cannot call a {} as a function",
+                other.type_name()
+            ))
+            .with_code("E0401")
+            .with_label(Label::primary(span, "this is not a function"))),
+        }
     }
 
     pub(crate) fn invoke(
@@ -1414,7 +1444,8 @@ impl Interpreter {
             .exports
             .get(file_name)
             .and_then(|m| m.get(name))
-            .cloned();
+            .cloned()
+            .or_else(|| stdlib::lookup(name));
         let Some(value) = value else {
             return Err(Diagnostic::error(format!(
                 "cannot import `{name}`: nothing exports it to `{file_name}`"
@@ -1423,7 +1454,8 @@ impl Interpreter {
             .with_label(Label::primary(span, "no matching export"))
             .with_note(
                 "another file in this program must run `export <name> to \"<this file>\"!` \
-                 before the import sees it.",
+                 before the import sees it, or `<name>` must be a known std package \
+                 (e.g. `http`).",
             ));
         };
         env::insert(

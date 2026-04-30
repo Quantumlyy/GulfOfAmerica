@@ -47,8 +47,8 @@ error[E0700]: cannot reassign `name`
 ## Feature matrix
 
 Every example in the upstream README has a corresponding integration test in
-`tests/spec.rs`. **78 of 78 spec tests pass** in this implementation, plus
-33 lexer/parser unit tests.
+`tests/spec.rs`. **78 of 78 upstream spec tests pass**, plus 33 lexer/parser
+unit tests, 11 std http tests, and a parser-recovery test.
 
 | Spec section | Status | Notes |
 | --- | --- | --- |
@@ -79,9 +79,51 @@ Every example in the upstream README has a corresponding integration test in
 | Async functions (line-interleaved execution) | ✅ | Un-`await`-ed calls queue a task that ticks one statement per main-thread statement; `await` runs synchronously and returns the result. |
 | Signals (`use(0)`, destructured pairs) | ✅ | `[get, set] = use(initial)` materialises a getter/setter pair sharing one cell. A non-destructured signal is itself callable: `sig()` reads, `sig(v)` writes. |
 | `reverse!` | ✅ | Reverses the remaining statements in the file. |
-| `import` / `export to` | ✅ | `export <name> to "file.gom"!` deposits a binding for `import <name>!` in the named `=====`-separated file. |
+| `import` / `export to` | ✅ | `export <name> to "file.gom"!` deposits a binding for `import <name>!` in the named `=====`-separated file. `import <name>!` also resolves built-in std packages (currently `http`) when no user export is in scope. |
 | DBX (HTML-in-source) | ❌ | |
 | AI features (Lu Wilson auto-completion) | ❌ | We unfortunately do not have Lu's email. |
+
+## Standard packages
+
+`import <name>!` falls back to a small built-in stdlib registry when no
+user-level export matches. User exports always win, so existing programs
+keep their semantics.
+
+| Package | Surface |
+| --- | --- |
+| `http` | `http.get(url)`, `http.post(url, body)`, `http.request({method, url, body, headers})`, `http.serve(addr, handler)`, `http.serve_once(addr, handler)`. Plain HTTP/1.1 over TCP — no TLS. Successful responses are `{ok: true, status, reason, body, headers}`. Connection / parse failures come back as data: `{ok: false, error, status: 0, body: "", headers: {}}` so user code can branch instead of aborting. The client decodes `Transfer-Encoding: chunked`. Handlers receive `{method, path, body, headers}` and may return a string body or a `{status, body, headers, reason}` object. |
+
+```text
+import http!
+function handle(req) => { return {status: 200, body: "hi " + req.path}! }
+http.serve_once("127.0.0.1:8765", handle)!
+```
+
+## Editor support (LSP)
+
+`gulf-lsp` is a Language Server for `.gom` files. It is feature-gated so the
+core interpreter stays dependency-free:
+
+```sh
+cargo build --release --features lsp --bin gulf-lsp
+# or:
+cargo install --path . --features lsp
+```
+
+Then point your editor at the `gulf-lsp` binary as the language server for
+`gulf` / `dreamberd` / `*.gom`. Capabilities in v0:
+
+- **Diagnostics** on open/change/save — lex + parse errors, with codes and
+  notes preserved. The parser recovers past statement-level errors so a
+  single broken line doesn't hide every other one in the file.
+- **Hover** for keywords, builtins, and the `http` std package.
+- **Document symbols** for top-level `function` / `class` / `let`s, with
+  class fields and methods nested as children.
+- **Goto-definition** for identifiers that resolve to a binding declared
+  at top level, inside a function body, or as a class method/field.
+
+Completion, semantic tokens, and formatting are intentionally out of scope
+for the first cut.
 
 ## Architecture
 
@@ -99,6 +141,13 @@ src/
 ├── value.rs          runtime values + per-allocation InstanceId for `====`
 ├── env.rs            scope chain with overload-priority + lifetime expiry
 ├── interpreter.rs    tree-walking evaluator
+├── interpreter/
+│   ├── builtins.rs   default globals (`print`, …)
+│   └── stdlib/       packages reachable via `import <name>!`
+│       └── http.rs   HTTP/1.1 client + server primitives
+├── lsp.rs            Language Server (feature = "lsp")
+├── bin/
+│   └── gulf-lsp.rs   thin stdio entry point for `gulf-lsp`
 └── main.rs           CLI: run / check / tokens / parse subcommands
 ```
 
@@ -108,7 +157,8 @@ under `#![forbid(unsafe_code)]`.
 ## Tests
 
 ```sh
-cargo test            # 111 tests: 33 unit + 78 spec
+cargo test                     # 122: 33 unit + 89 spec
+cargo test --features lsp      # adds 14 lsp tests (= 136 total)
 cargo clippy --all-targets
 ```
 

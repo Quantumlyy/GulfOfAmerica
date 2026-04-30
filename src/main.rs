@@ -144,8 +144,16 @@ fn check_file(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if let Err(d) = parser::parse(&file, tokens) {
-        eprintln!("{}", d.render(&file));
+    let (_, diags) = parser::parse_recovering(&file, tokens);
+    if !diags.is_empty() {
+        for d in &diags {
+            eprintln!("{}", d.render(&file));
+        }
+        eprintln!(
+            "{} parse error{}",
+            diags.len(),
+            if diags.len() == 1 { "" } else { "s" }
+        );
         return ExitCode::from(1);
     }
     println!("ok: {} parses cleanly", file.name);

@@ -1,0 +1,18 @@
+// Tiny HTTP demo. Run me, then in another shell:
+//
+//     curl -i http://127.0.0.1:8765/world
+//
+// `serve_once` accepts exactly one connection and then returns, which keeps
+// this example honest about its lifecycle. Use `http.serve` for a real
+// server loop.
+
+import http!
+
+function handle(req) => {
+   const const reply = "hello from " + req.method + " " + req.path!
+   return {status: 200, body: reply}!
+}
+
+print("listening on http://127.0.0.1:8765 (one shot)")!
+http.serve_once("127.0.0.1:8765", handle)!
+print("served, exiting")!
